@@ -1,14 +1,22 @@
-import streamlit as st
-import pandas as pd
-import random
+import os
 import json
+import random
 from typing import List, Dict, Tuple, Any
+
+import pandas as pd
+import streamlit as st
 
 from game_core import (
     Portfolio, init_portfolios, generate_withdrawal,
     execute_repo, execute_sale, execute_buy,
     execute_invest_td, execute_redeem_td,
     process_maturities
+)
+
+# === Room persistence ===
+from room_store import (
+    create_room, get_room, update_room, save_csv,
+    set_room_portfolios, get_room_portfolios, replace_logs
 )
 
 st.set_page_config(page_title="Liquidity Tranche Simulation", layout="wide")
@@ -185,9 +193,22 @@ def _init_state():
     # role & player selection
     ss.role = "Host"
     ss.player_group_index = 0
+    # room basics
+    ss.room_code = "ROOM1"
 
 if "initialized" not in st.session_state:
     _init_state()
+
+# ------------
+# Room + CSV cache helpers
+# ------------
+@st.cache_data
+def _load_csv_shared(csv_path: str, mtime: float) -> pd.DataFrame:
+    """Cache CSV by (path, mtime) so all clients pick up changes."""
+    return pd.read_csv(csv_path)
+
+def _autopoll(room_code: str, ms: int = 3000):
+    st.autorefresh(interval=ms, key=f"poll_{room_code}")
 
 # ------------------------
 # Helpers
@@ -300,11 +321,31 @@ def _safe_buy(portfolio: Portfolio, ticker: str, qty: float, px: float) -> Dict[
     return {"ticker": ticker, "qty": qty, "cost": qty*px, "effective_price": px}
 
 # ------------------------
-# Role selector (top of sidebar)
+# Room + Role (top of sidebar)
 # ------------------------
 st.sidebar.markdown("### Session")
-role = st.sidebar.radio("Role", ["Host", "Player"], index=0 if st.session_state.role == "Host" else 1)
+room_code = st.sidebar.text_input("Room code", value=st.session_state.get("room_code", "ROOM1")).strip().upper()
+st.session_state.room_code = room_code
+
+role = st.sidebar.radio("Role", ["Host", "Player"], index=0 if st.session_state.role == "Host" else 1, horizontal=True)
 st.session_state.role = role
+
+# Create/ensure a room record exists (lazy create for host)
+room_state = get_room(room_code)
+if role == "Host" and not room_state:
+    # seed minimal room
+    update_room(room_code,
+        room_id=room_code,
+        rounds=3,
+        current_round=0,
+        csv_path="",
+        tickers=[],
+        withdrawals=[],
+        logs={},
+        portfolios=[],
+        params={"rng_seed": 1234, "last_maturity_round": -1},
+    )
+    room_state = get_room(room_code)
 
 # ------------------------
 # Sidebar — conditional by role
@@ -319,22 +360,16 @@ if role == "Host":
     c1, c2 = st.sidebar.columns(2)
     start_clicked = c1.button("Start/Reset", type="primary")
     end_clicked   = c2.button("End Game")
+
+    # Host CSV save
+    if uploaded is not None:
+        save_csv(room_code, uploaded)  # writes to data/uploads/<room_code>.csv and updates tickers
+        st.sidebar.success("CSV saved for this room. Players will see it shortly.")
 else:
     st.sidebar.header("Player Setup")
-    uploaded = None
-    # Show which groups exist (after host starts)
-    if st.session_state.initialized and st.session_state.portfolios:
-        available_groups = [p.name for p in st.session_state.portfolios]
-        default_idx = min(st.session_state.player_group_index, max(0, len(available_groups)-1))
-        player_group_name = st.sidebar.selectbox("Select your Group", available_groups, index=default_idx)
-        st.session_state.player_group_index = available_groups.index(player_group_name)
-    else:
-        st.sidebar.info("Waiting for Host to start and upload a CSV…")
-    # Player cannot start/end
     start_clicked = False
     end_clicked = False
-    # Keep seed/rounds/groups as current values for display only
-    st.sidebar.caption(f"Rounds: {st.session_state.rounds} • Groups: {st.session_state.num_groups} • RNG seed: {st.session_state.rng_seed}")
+    st.sidebar.caption("Host controls are hidden for players.")
 
 with st.sidebar.expander("Game Instructions", expanded=False):
     st.markdown(f"""
@@ -342,61 +377,84 @@ with st.sidebar.expander("Game Instructions", expanded=False):
 - **Term Deposits (TD):** Assets that mature after **{TD_MAT_GAP} rounds**. Early redemption penalty: **{TD_PENALTY*100:.2f}%**.
 - **Rates:** Repo & TD vary daily by **±50 bps** around base and are stored per trade.
 - **Initial TD allocation:** In **Round 1** only, each group randomly invests **10–30%** of Current Account into TD.
-- **Apply Action:** Cash/Repo/Sell/Redeem TD immediately **deduct** the “used” portion from Current Account toward withdrawal.
-- **Clear Actions:** Fully **reverts** this round’s actions for that group.
-- **Next Round:** Settle maturities first, then create a new withdrawal (same for all groups).
+- **Apply/Clear:** Affect only your group (unless you are Host).
 - Only the **Host** can **Start/Reset**, **Next Round**, and **End Game**.
 - Currency: **$**.
 """)
 
 # ------------------------
+# Load shared CSV (everyone reads the same)
+# ------------------------
+room_state = get_room(room_code)  # refresh after potential upload
+csv_path = room_state.get("csv_path", "") if room_state else ""
+if not csv_path or not os.path.exists(csv_path):
+    if role == "Player":
+        st.info("Waiting for host to upload CSV for this room…")
+        _autopoll(room_code)
+    else:
+        st.info("Upload a CSV (left sidebar) and click **Start/Reset**.")
+    st.stop()
+
+mtime = os.path.getmtime(csv_path)
+df = _load_csv_shared(csv_path, mtime)
+
+# ------------------------
 # Start / End (Host only)
 # ------------------------
 if role == "Host" and start_clicked:
-    if uploaded is None:
-        st.sidebar.error("Please upload a CSV with columns: date,BOND_A,BOND_B,BOND_C,...")
+    if "date" not in df.columns or len([c for c in df.columns if c != "date"]) < 3:
+        st.sidebar.error("CSV must have 'date' and at least 3 security columns.")
     else:
-        df = pd.read_csv(uploaded)
-        if "date" not in df.columns or len([c for c in df.columns if c != "date"]) < 3:
-            st.sidebar.error("CSV must have 'date' and at least 3 security columns.")
-        else:
-            seed_val = int(seed); rounds_val = int(rounds)
-            desired_groups = int(groups)
+        seed_val = int(seed); rounds_val = int(rounds)
+        desired_groups = int(groups)
 
-            _init_state()
-            st.session_state.initialized   = True
-            st.session_state.rng_seed      = seed_val
-            st.session_state.rounds        = rounds_val
-            st.session_state.price_df      = df.copy()
+        _init_state()
+        st.session_state.initialized   = True
+        st.session_state.rng_seed      = seed_val
+        st.session_state.rounds        = rounds_val
+        st.session_state.price_df      = df.copy()
 
-            tickers_all = [c for c in df.columns if c != "date"]
-            date0, prices0 = base_prices_for_round(0, df, tickers_all)
+        tickers_all = [c for c in df.columns if c != "date"]
+        date0, prices0 = base_prices_for_round(0, df, tickers_all)
 
-            # Get base portfolios from game_core, then cap/slice to Host’s choice
-            base_portfolios = init_portfolios(tickers_all, prices0, total_reserve=200000.0)
-            available = len(base_portfolios)
-            cap = min(MAX_GROUPS_UI, available, desired_groups)
-            if desired_groups > cap:
-                st.sidebar.warning(f"Requested {desired_groups} groups, but only {cap} available. Capped automatically.")
-            st.session_state.portfolios = base_portfolios[:cap]
-            st.session_state.num_groups = cap
+        # Get base portfolios, then cap/slice to Host’s choice (up to MAX_GROUPS_UI)
+        base_portfolios = init_portfolios(tickers_all, prices0, total_reserve=200000.0)
+        available = len(base_portfolios)
+        cap = min(MAX_GROUPS_UI, available, desired_groups)
+        if desired_groups > cap:
+            st.sidebar.warning(f"Requested {desired_groups} groups, but only {cap} available. Capped automatically.")
+        st.session_state.portfolios = base_portfolios[:cap]
+        st.session_state.num_groups = cap
 
-            # Random initial TD allocation (Round 1 only, 10–30% of CA at base TD rate)
-            for p in st.session_state.portfolios:
-                frac = random.uniform(0.10, 0.30)
-                amt = round(max(0.0, p.current_account) * frac, 2)
-                if amt > 0:
-                    execute_invest_td(p, amt, 0, rate=BASE_TD_RATE)
+        # Random initial TD allocation (Round 1 only, 10–30% of CA at base TD rate)
+        for p in st.session_state.portfolios:
+            frac = random.uniform(0.10, 0.30)
+            amt = round(max(0.0, p.current_account) * frac, 2)
+            if amt > 0:
+                execute_invest_td(p, amt, 0, rate=BASE_TD_RATE)
 
-            st.session_state.logs        = {p.name: [] for p in st.session_state.portfolios}
-            st.session_state.withdrawals = [0.0 for _ in range(rounds_val)]
-            st.session_state.current_round = 0
-            st.session_state.last_maturity_round = -1
-            st.session_state.inited_rounds = set()
-            st.session_state.player_group_index = 0
+        st.session_state.logs        = {p.name: [] for p in st.session_state.portfolios}
+        st.session_state.withdrawals = [0.0 for _ in range(rounds_val)]
+        st.session_state.current_round = 0
+        st.session_state.last_maturity_round = -1
+        st.session_state.inited_rounds = set()
+        st.session_state.player_group_index = 0
+
+        # Persist to room so all clients stay in sync
+        set_room_portfolios(room_code, st.session_state.portfolios)
+        replace_logs(room_code, st.session_state.logs)
+        update_room(
+            room_code,
+            rounds=int(st.session_state.rounds),
+            current_round=int(st.session_state.current_round),
+            params={"rng_seed": int(st.session_state.rng_seed), "last_maturity_round": int(st.session_state.last_maturity_round)},
+            tickers=[c for c in df.columns if c != "date"],
+            withdrawals=st.session_state.withdrawals,
+        )
 
 if role == "Host" and end_clicked and st.session_state.initialized:
     st.session_state.current_round = st.session_state.rounds
+    update_room(room_code, current_round=int(st.session_state.rounds))
     st.rerun()
 
 # ------------------------
@@ -404,14 +462,36 @@ if role == "Host" and end_clicked and st.session_state.initialized:
 # ------------------------
 st.title("Liquidity Tranche Simulation")
 
+# Players mirror host session (portfolios/logs/rounds) whenever available
+room_state = get_room(room_code) or {}
+if role == "Player":
+    # Pull round
+    host_round = int(room_state.get("current_round", 0))
+    if st.session_state.get("current_round", 0) != host_round:
+        st.session_state.current_round = host_round
+    # Pull rounds setting
+    if "rounds" in room_state:
+        st.session_state.rounds = int(room_state["rounds"])
+    # Pull portfolios/logs
+    try:
+        st.session_state.portfolios = get_room_portfolios(room_code)
+        st.session_state.logs = room_state.get("logs", st.session_state.logs)
+        st.session_state.initialized = bool(st.session_state.portfolios)
+        st.session_state.num_groups = max(1, len(st.session_state.portfolios))
+    except Exception:
+        pass
+
 if not st.session_state.initialized:
-    if role == "Host":
-        st.info("Upload a CSV and click **Start/Reset** to begin.")
+    if role == "Player":
+        st.info("Waiting for the Host to start the session…")
+        _autopoll(room_code)
     else:
-        st.info("Waiting for the Host to start the session.")
+        st.info("Upload a CSV and click **Start/Reset** to begin.")
     st.stop()
 
-df = st.session_state.price_df
+# CSV already loaded into df; ensure session keeps a copy for price lookups
+st.session_state.price_df = df.copy()
+
 all_tickers = [c for c in df.columns if c != "date"]
 tickers = all_tickers[:3]  # show/use first 3
 r = st.session_state.current_round
@@ -585,6 +665,10 @@ if st.session_state.pending_apply is not None:
                 "actions": history
             })
 
+        # Persist changes so everyone sees them
+        replace_logs(room_code, st.session_state.logs)
+        set_room_portfolios(room_code, st.session_state.portfolios)
+
         # Reset inputs BEFORE widgets render
         for key in [cash_key, repo_amt_key, redeem_key, invest_key, sell_qty_key, buy_qty_key]:
             st.session_state[key] = 0.0
@@ -671,6 +755,10 @@ if st.session_state.pending_clear is not None:
             L for L in st.session_state.logs.get(p.name, []) if L["round"] != r_clear + 1
         ]
 
+        # Persist changes
+        replace_logs(room_code, st.session_state.logs)
+        set_room_portfolios(room_code, st.session_state.portfolios)
+
         # Reset inputs BEFORE widgets render
         for key in [
             f"cash_{r_clear}_{g_clear}", f"repo_{r_clear}_{g_clear}",
@@ -683,6 +771,15 @@ if st.session_state.pending_clear is not None:
         st.session_state[f"buy_t_{r_clear}_{g_clear}"]  = "(none)"
 
     st.session_state.pending_clear = None
+
+# ------------------------
+# Player group selection (after portfolios exist)
+# ------------------------
+if role == "Player" and st.session_state.portfolios:
+    available_groups = [p.name for p in st.session_state.portfolios]
+    default_idx = min(st.session_state.player_group_index, max(0, len(available_groups)-1))
+    player_group_name = st.sidebar.selectbox("My group", available_groups, index=default_idx)
+    st.session_state.player_group_index = available_groups.index(player_group_name)
 
 # ------------------------
 # Round dashboard (everyone can see, only own group is editable)
@@ -823,8 +920,12 @@ for g, tab in enumerate(tabs):
             pass
 
         b1, b2 = st.columns([2,1])
-        b1.button("Apply action", key=f"apply_{r}_{g}", on_click=lambda gg=g: st.session_state.update(pending_apply={"g": gg, "r": r}), disabled=not editable)
-        b2.button("Clear Actions", key=f"clear_{r}_{g}", on_click=lambda gg=g: st.session_state.update(pending_clear={"g": gg, "r": r}), disabled=not editable)
+        b1.button("Apply action", key=f"apply_{r}_{g}",
+                  on_click=lambda gg=g: st.session_state.update(pending_apply={"g": gg, "r": r}),
+                  disabled=not editable)
+        b2.button("Clear Actions", key=f"clear_{r}_{g}",
+                  on_click=lambda gg=g: st.session_state.update(pending_clear={"g": gg, "r": r}),
+                  disabled=not editable)
 
 # ------------------------
 # Next Round controls (Host only)
@@ -841,10 +942,12 @@ all_covered = all(
 
 if role == "Host":
     with rgt:
-        st.button("Next Round ▶️", key=f"next_round_{r}", on_click=lambda: st.session_state.update(_next_round_clicked=True))
+        st.button("Next Round ▶️", key=f"next_round_{r}",
+                  on_click=lambda: st.session_state.update(_next_round_clicked=True))
 else:
     with rgt:
         st.caption("Only the Host can advance rounds.")
+        _autopoll(room_code)  # players auto-refresh while waiting
 
 if st.session_state.get("_next_round_clicked", False):
     st.session_state._next_round_clicked = False
@@ -856,7 +959,8 @@ if st.session_state.get("_next_round_clicked", False):
         else:
             if st.session_state.current_round + 1 < st.session_state.rounds:
                 st.session_state.current_round += 1
-                st.rerun()
             else:
                 st.session_state.current_round = st.session_state.rounds
-                st.rerun()
+            # sync to room so players advance immediately
+            update_room(room_code, current_round=int(st.session_state.current_round))
+            st.rerun()
