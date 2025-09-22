@@ -1,0 +1,19 @@
+# venv / local
+game_env/
+.env
+.streamlit/secrets.toml
+
+# caches & compiled
+__pycache__/
+*.pyc
+
+# local DB / state
+game_state.db
+room_state.db
+
+# OS / editor files
+.DS_Store
+Thumbs.db
+
+# data files you dont want public
+*.csv
