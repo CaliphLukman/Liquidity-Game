@@ -1,7 +1,6 @@
 # streamlit_app.py
 import os
 import json
-import io
 import time
 import random
 from typing import List, Dict, Tuple, Any
@@ -348,26 +347,13 @@ st.sidebar.markdown("### Session")
 role = st.sidebar.radio("Role", ["Host", "Player"], index=(0 if st.session_state.role == "Host" else 1))
 st.session_state.role = role
 
+# ✅ Robust player auto-refresh (no experimental APIs needed)
+# Refresh the page every 2 seconds for Player sessions
 if role == "Player":
-    # Light polling so Players automatically reflect Host changes (2s)
-    st_autorefresh = st.experimental_memo(lambda: None)  # keep linter happy for older versions
-    try:
-        st.experimental_singleton.clear()  # no-op if unsupported
-    except Exception:
-        pass
-    try:
-        st_autorefresh = st.experimental_rerun  # also keep reference if available
-    except Exception:
-        pass
-    try:
-        st_autorefresh = st.autorefresh  # newer API if present
-    except Exception:
-        pass
-    try:
-        st.autorefresh(interval=2000, key="player_poll_tick")
-    except Exception:
-        # older versions: best-effort; no crash
-        pass
+    st.markdown(
+        "<script>setTimeout(function(){window.location.reload();}, 2000);</script>",
+        unsafe_allow_html=True
+    )
 
 # ------------------------
 # Sidebar — conditional by role
@@ -534,7 +520,6 @@ if role == "Player":
         host_round = int(shared.get("current_round", st.session_state.current_round))
         if host_round != st.session_state.current_round:
             st.session_state.current_round = host_round
-            # allow settle path to run naturally below
 
 df = st.session_state.price_df
 all_tickers = [c for c in df.columns if c != "date"]
@@ -960,7 +945,7 @@ all_covered = all(
     for i in range(min(NG, len(st.session_state.portfolios)))
 )
 
-if role == "Host":
+if st.session_state.role == "Host":
     with rgt:
         st.button("Next Round ▶️", key=f"next_round_{r}",
                   on_click=lambda: st.session_state.update(_next_round_clicked=True))
@@ -970,7 +955,7 @@ else:
 
 if st.session_state.get("_next_round_clicked", False):
     st.session_state._next_round_clicked = False
-    if role != "Host":
+    if st.session_state.role != "Host":
         st.error("Only the Host can advance rounds.")
     else:
         if not all_covered:
