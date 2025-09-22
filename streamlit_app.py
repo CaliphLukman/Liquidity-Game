@@ -1,10 +1,8 @@
-import os
-import json
-import random
-from typing import List, Dict, Tuple, Any
-
-import pandas as pd
 import streamlit as st
+import pandas as pd
+import random
+import json
+from typing import List, Dict, Tuple, Any
 
 from game_core import (
     Portfolio, init_portfolios, generate_withdrawal,
@@ -13,11 +11,20 @@ from game_core import (
     process_maturities
 )
 
-# === Room persistence ===
-from room_store import (
-    create_room, get_room, update_room, save_csv,
-    set_room_portfolios, get_room_portfolios, replace_logs
+# --- global single-room store helpers ---
+from global_store import (
+    init_state_if_missing, get_state, update_state,
+    save_csv_to_global, read_csv_df,
+    set_serialized_portfolios, get_deserialized_portfolios,
+    replace_logs, claim_group, release_group
 )
+
+# Optional gentle auto-refresh (if installed)
+try:
+    from streamlit_autorefresh import st_autorefresh
+    st_autorefresh(interval=3000, key="live_sync")  # refresh every 3s
+except Exception:
+    pass
 
 st.set_page_config(page_title="Liquidity Tranche Simulation", layout="wide")
 
@@ -169,46 +176,19 @@ TD_MAT_GAP     = 2          # TDs mature after 2 rounds (handled in game_core)
 MAX_GROUPS_UI  = 8          # Host can choose up to 8
 
 # ------------------------
-# Session State bootstrap
+# Local session bootstrap (role & identity)
 # ------------------------
-def _init_state():
+def _ensure_session():
     ss = st.session_state
-    ss.initialized = False
-    ss.rng_seed = 1234
-    ss.rounds = 3
-    ss.current_round = 0
-    # Same withdrawal for ALL groups each round
-    ss.withdrawals: List[float] = []
-    ss.portfolios: List[Portfolio] = []
-    ss.logs: Dict[str, List[dict]] = {}
-    ss.price_df = None
-    # per-round processing guards
-    ss.last_maturity_round = -1
-    ss.inited_rounds = set()
-    # queued actions (processed BEFORE widgets render)
-    ss.pending_apply: Dict[str,int] | None = None
-    ss.pending_clear: Dict[str,int] | None = None
-    # dynamic groups
-    ss.num_groups = 4  # default
-    # role & player selection
-    ss.role = "Host"
-    ss.player_group_index = 0
-    # room basics
-    ss.room_code = "ROOM1"
+    if "role" not in ss:
+        ss.role = "Host"   # default role for first visitor
+    if "player_token" not in ss:
+        # lightweight identity per browser session
+        import uuid
+        ss.player_token = uuid.uuid4().hex
 
-if "initialized" not in st.session_state:
-    _init_state()
-
-# ------------
-# Room + CSV cache helpers
-# ------------
-@st.cache_data
-def _load_csv_shared(csv_path: str, mtime: float) -> pd.DataFrame:
-    """Cache CSV by (path, mtime) so all clients pick up changes."""
-    return pd.read_csv(csv_path)
-
-def _autopoll(room_code: str, ms: int = 3000):
-    st.autorefresh(interval=ms, key=f"poll_{room_code}")
+_ensure_session()
+init_state_if_missing()  # makes sure global_state.json exists
 
 # ------------------------
 # Helpers
@@ -222,28 +202,30 @@ def base_prices_for_round(r: int, df: pd.DataFrame, tickers: List[str]) -> Tuple
     return str(df.loc[ix, "date"]), {t: float(df.loc[ix, t]) for t in tickers}
 
 def daily_rates_for_round(r: int) -> Tuple[float, float]:
-    rng = random.Random(st.session_state.rng_seed * 991 + r * 7919)
+    rng = random.Random(st.session_state.get("rng_seed", 1234) * 991 + r * 7919)
     repo_delta = rng.uniform(-DAILY_SPREAD, DAILY_SPREAD)
     td_delta   = rng.uniform(-DAILY_SPREAD, DAILY_SPREAD)
     return max(0.0, BASE_REPO_RATE + repo_delta), max(0.0, BASE_TD_RATE + td_delta)
 
-def ensure_round_initialized(r: int, prices_for_mv: Dict[str, float]):
-    """Create the round withdrawal (same for all groups)."""
-    ss = st.session_state
-    if r >= ss.rounds or r in ss.inited_rounds:
-        return
-    if len(ss.withdrawals) < ss.rounds:
-        ss.withdrawals = [0.0 for _ in range(ss.rounds)]
-    req = generate_withdrawal(r, ss.portfolios[0].market_value(prices_for_mv),
-                              random.Random(ss.rng_seed + 10007*r))
-    ss.withdrawals[r] = float(req)
-    ss.inited_rounds.add(r)
+def ensure_round_initialized(r: int, prices_for_mv: Dict[str, float], portfolios: List[Portfolio], rng_seed: int, rounds: int, withdrawals: List[float]) -> List[float]:
+    """Create the round withdrawal (same for all groups). Returns possibly-updated withdrawals list."""
+    if r >= rounds:
+        return withdrawals
+    inited_rounds = {i for i, v in enumerate(withdrawals) if v != 0.0}
+    if r in inited_rounds:
+        return withdrawals
+    if len(withdrawals) < rounds:
+        withdrawals = [0.0 for _ in range(rounds)]
+    req = generate_withdrawal(r, portfolios[0].market_value(prices_for_mv),
+                              random.Random(rng_seed + 10007*r))
+    withdrawals[r] = float(req)
+    return withdrawals
 
-def compute_remaining_for_group(group_name: str, r: int, req_for_round: float) -> float:
+def compute_remaining_for_group(group_name: str, r: int, req_for_round: float, logs: Dict[str, List[dict]]) -> float:
     """Remaining = req - sum of cash used + repo/sell/redeem 'use' in this round."""
-    logs = [L for L in st.session_state.logs.get(group_name, []) if L["round"] == r+1]
+    logs_r = [L for L in logs.get(group_name, []) if L["round"] == r+1]
     used = 0.0
-    for L in logs:
+    for L in logs_r:
         for t, d in L["actions"]:
             if t == "cash":
                 used += float(d.get("used", 0.0))
@@ -321,31 +303,18 @@ def _safe_buy(portfolio: Portfolio, ticker: str, qty: float, px: float) -> Dict[
     return {"ticker": ticker, "qty": qty, "cost": qty*px, "effective_price": px}
 
 # ------------------------
-# Room + Role (top of sidebar)
+# Role selector (top of sidebar)
 # ------------------------
 st.sidebar.markdown("### Session")
-room_code = st.sidebar.text_input("Room code", value=st.session_state.get("room_code", "ROOM1")).strip().upper()
-st.session_state.room_code = room_code
-
-role = st.sidebar.radio("Role", ["Host", "Player"], index=0 if st.session_state.role == "Host" else 1, horizontal=True)
+role = st.sidebar.radio("Role", ["Host", "Player"], index=0 if st.session_state.role == "Host" else 1)
 st.session_state.role = role
+player_token = st.session_state.player_token
 
-# Create/ensure a room record exists (lazy create for host)
-room_state = get_room(room_code)
-if role == "Host" and not room_state:
-    # seed minimal room
-    update_room(room_code,
-        room_id=room_code,
-        rounds=3,
-        current_round=0,
-        csv_path="",
-        tickers=[],
-        withdrawals=[],
-        logs={},
-        portfolios=[],
-        params={"rng_seed": 1234, "last_maturity_round": -1},
-    )
-    room_state = get_room(room_code)
+# ------------------------
+# Load global state every run
+# ------------------------
+state = get_state()
+# state keys: csv_path, rounds, current_round, rng_seed, last_maturity_round, tickers, withdrawals, portfolios(serialized), logs, num_groups, group_claims{}
 
 # ------------------------
 # Sidebar — conditional by role
@@ -353,23 +322,66 @@ if role == "Host" and not room_state:
 if role == "Host":
     st.sidebar.header("Host Setup")
     uploaded = st.sidebar.file_uploader("Bond price CSV (date + ≥3 securities)", type=["csv"])
-    seed = st.sidebar.number_input("RNG seed", value=st.session_state.rng_seed, step=1)
-    rounds = st.sidebar.number_input("Rounds", value=st.session_state.rounds, min_value=1, max_value=10, step=1)
-    groups = st.sidebar.number_input("Groups (up to 8)", value=st.session_state.num_groups, min_value=1, max_value=MAX_GROUPS_UI, step=1)
+    seed_in = st.sidebar.number_input("RNG seed", value=int(state.get("rng_seed", 1234)), step=1)
+    rounds_in = st.sidebar.number_input("Rounds", value=int(state.get("rounds", 3)), min_value=1, max_value=10, step=1)
+    groups_in = st.sidebar.number_input("Groups (up to 8)", value=int(state.get("num_groups", 4)), min_value=1, max_value=MAX_GROUPS_UI, step=1)
 
     c1, c2 = st.sidebar.columns(2)
     start_clicked = c1.button("Start/Reset", type="primary")
     end_clicked   = c2.button("End Game")
-
-    # Host CSV save
-    if uploaded is not None:
-        save_csv(room_code, uploaded)  # writes to data/uploads/<room_code>.csv and updates tickers
-        st.sidebar.success("CSV saved for this room. Players will see it shortly.")
 else:
     st.sidebar.header("Player Setup")
+    uploaded = None
     start_clicked = False
     end_clicked = False
-    st.sidebar.caption("Host controls are hidden for players.")
+
+    # Show current config
+    st.sidebar.caption(f"Rounds: {state.get('rounds', 3)} • Groups: {state.get('num_groups', 4)} • RNG seed: {state.get('rng_seed', 1234)}")
+
+    # Group claiming UI
+    portfolios = get_deserialized_portfolios()
+    names = [p.name for p in portfolios] if portfolios else []
+    claims = state.get("group_claims", {})
+    if names:
+        # Build display labels with claim info
+        labels = []
+        free_indices = []
+        my_indices = []
+        for i, n in enumerate(names):
+            claimed_by = claims.get(str(i))
+            if claimed_by is None:
+                labels.append(f"{n} (free)")
+                free_indices.append(i)
+            elif claimed_by == player_token:
+                labels.append(f"{n} (you)")
+                my_indices.append(i)
+            else:
+                labels.append(f"{n} (taken)")
+        # selection limited to free or mine
+        selectable = [i for i in range(len(names)) if (claims.get(str(i)) in (None, player_token))]
+        if not selectable:
+            st.sidebar.info("All groups are taken. Ask the host to free one.")
+            chosen_index = None
+        else:
+            default_idx = selectable[0]
+            chosen_index = st.sidebar.selectbox("Choose your group", selectable, index=selectable.index(default_idx), format_func=lambda i: labels[i])
+        c1, c2 = st.sidebar.columns(2)
+        if chosen_index is not None:
+            if c1.button("Claim / Switch"):
+                ok, msg = claim_group(chosen_index, player_token)
+                if not ok:
+                    st.sidebar.error(msg)
+                else:
+                    st.experimental_rerun()
+        # Allow release if you have any
+        yours = [i for i in range(len(names)) if claims.get(str(i)) == player_token]
+        if yours:
+            idx_to_release = st.sidebar.selectbox("Release my group", yours, format_func=lambda i: names[i])
+            if c2.button("Release"):
+                release_group(idx_to_release, player_token)
+                st.experimental_rerun()
+    else:
+        st.sidebar.info("Waiting for Host to start…")
 
 with st.sidebar.expander("Game Instructions", expanded=False):
     st.markdown(f"""
@@ -377,132 +389,103 @@ with st.sidebar.expander("Game Instructions", expanded=False):
 - **Term Deposits (TD):** Assets that mature after **{TD_MAT_GAP} rounds**. Early redemption penalty: **{TD_PENALTY*100:.2f}%**.
 - **Rates:** Repo & TD vary daily by **±50 bps** around base and are stored per trade.
 - **Initial TD allocation:** In **Round 1** only, each group randomly invests **10–30%** of Current Account into TD.
-- **Apply/Clear:** Affect only your group (unless you are Host).
+- **Apply Action:** Cash/Repo/Sell/Redeem TD immediately **deduct** the “used” portion from Current Account toward withdrawal.
+- **Clear Actions:** Fully **reverts** this round’s actions for that group.
+- **Next Round:** Settle maturities first, then create a new withdrawal (same for all groups).
 - Only the **Host** can **Start/Reset**, **Next Round**, and **End Game**.
 - Currency: **$**.
 """)
 
 # ------------------------
-# Load shared CSV (everyone reads the same)
-# ------------------------
-room_state = get_room(room_code)  # refresh after potential upload
-csv_path = room_state.get("csv_path", "") if room_state else ""
-if not csv_path or not os.path.exists(csv_path):
-    if role == "Player":
-        st.info("Waiting for host to upload CSV for this room…")
-        _autopoll(room_code)
-    else:
-        st.info("Upload a CSV (left sidebar) and click **Start/Reset**.")
-    st.stop()
-
-mtime = os.path.getmtime(csv_path)
-df = _load_csv_shared(csv_path, mtime)
-
-# ------------------------
 # Start / End (Host only)
 # ------------------------
 if role == "Host" and start_clicked:
-    if "date" not in df.columns or len([c for c in df.columns if c != "date"]) < 3:
-        st.sidebar.error("CSV must have 'date' and at least 3 security columns.")
+    if uploaded is None:
+        st.sidebar.error("Please upload a CSV with columns: date,BOND_A,BOND_B,BOND_C,...")
     else:
-        seed_val = int(seed); rounds_val = int(rounds)
-        desired_groups = int(groups)
+        path = save_csv_to_global(uploaded)
+        df = read_csv_df()
+        if df is None or "date" not in df.columns or len([c for c in df.columns if c != "date"]) < 3:
+            st.sidebar.error("CSV must have 'date' and at least 3 security columns.")
+        else:
+            seed_val = int(seed_in)
+            rounds_val = int(rounds_in)
+            groups_val = int(groups_in)
 
-        _init_state()
-        st.session_state.initialized   = True
-        st.session_state.rng_seed      = seed_val
-        st.session_state.rounds        = rounds_val
-        st.session_state.price_df      = df.copy()
+            tickers_all = [c for c in df.columns if c != "date"]
+            # Init portfolios from game_core (base four), cap to groups_val (<=8)
+            date0, prices0 = str(df.loc[0, "date"]), {t: float(df.loc[0, t]) for t in tickers_all}
+            base_portfolios = init_portfolios(tickers_all, prices0, total_reserve=200000.0)
+            cap = min(MAX_GROUPS_UI, max(1, groups_val), len(base_portfolios))
+            portfolios = base_portfolios[:cap]
 
-        tickers_all = [c for c in df.columns if c != "date"]
-        date0, prices0 = base_prices_for_round(0, df, tickers_all)
+            # Random initial TD allocation (Round 1 only, 10–30% of CA at base TD rate)
+            for p in portfolios:
+                frac = random.uniform(0.10, 0.30)
+                amt = round(max(0.0, p.current_account) * frac, 2)
+                if amt > 0:
+                    execute_invest_td(p, amt, 0, rate=BASE_TD_RATE)
 
-        # Get base portfolios, then cap/slice to Host’s choice (up to MAX_GROUPS_UI)
-        base_portfolios = init_portfolios(tickers_all, prices0, total_reserve=200000.0)
-        available = len(base_portfolios)
-        cap = min(MAX_GROUPS_UI, available, desired_groups)
-        if desired_groups > cap:
-            st.sidebar.warning(f"Requested {desired_groups} groups, but only {cap} available. Capped automatically.")
-        st.session_state.portfolios = base_portfolios[:cap]
-        st.session_state.num_groups = cap
+            # Reset logs and withdrawals
+            logs = {p.name: [] for p in portfolios}
+            withdrawals = [0.0 for _ in range(rounds_val)]
 
-        # Random initial TD allocation (Round 1 only, 10–30% of CA at base TD rate)
-        for p in st.session_state.portfolios:
-            frac = random.uniform(0.10, 0.30)
-            amt = round(max(0.0, p.current_account) * frac, 2)
-            if amt > 0:
-                execute_invest_td(p, amt, 0, rate=BASE_TD_RATE)
+            # Write global state
+            update_state(
+                csv_path=path,
+                tickers=tickers_all,
+                rounds=rounds_val,
+                current_round=0,
+                rng_seed=seed_val,
+                last_maturity_round=-1,
+                withdrawals=withdrawals,
+                logs=logs,
+                num_groups=cap,
+                group_claims={},   # all free
+            )
+            set_serialized_portfolios(portfolios)
+            st.success("Game started. Share this same URL with players.")
+            st.experimental_rerun()
 
-        st.session_state.logs        = {p.name: [] for p in st.session_state.portfolios}
-        st.session_state.withdrawals = [0.0 for _ in range(rounds_val)]
-        st.session_state.current_round = 0
-        st.session_state.last_maturity_round = -1
-        st.session_state.inited_rounds = set()
-        st.session_state.player_group_index = 0
-
-        # Persist to room so all clients stay in sync
-        set_room_portfolios(room_code, st.session_state.portfolios)
-        replace_logs(room_code, st.session_state.logs)
-        update_room(
-            room_code,
-            rounds=int(st.session_state.rounds),
-            current_round=int(st.session_state.current_round),
-            params={"rng_seed": int(st.session_state.rng_seed), "last_maturity_round": int(st.session_state.last_maturity_round)},
-            tickers=[c for c in df.columns if c != "date"],
-            withdrawals=st.session_state.withdrawals,
-        )
-
-if role == "Host" and end_clicked and st.session_state.initialized:
-    st.session_state.current_round = st.session_state.rounds
-    update_room(room_code, current_round=int(st.session_state.rounds))
-    st.rerun()
+if role == "Host" and end_clicked:
+    # Move to end state (show scoreboard)
+    update_state(current_round=get_state().get("rounds", 0))
+    st.experimental_rerun()
 
 # ------------------------
 # Main UI
 # ------------------------
 st.title("Liquidity Tranche Simulation")
 
-# Players mirror host session (portfolios/logs/rounds) whenever available
-room_state = get_room(room_code) or {}
-if role == "Player":
-    # Pull round
-    host_round = int(room_state.get("current_round", 0))
-    if st.session_state.get("current_round", 0) != host_round:
-        st.session_state.current_round = host_round
-    # Pull rounds setting
-    if "rounds" in room_state:
-        st.session_state.rounds = int(room_state["rounds"])
-    # Pull portfolios/logs
-    try:
-        st.session_state.portfolios = get_room_portfolios(room_code)
-        st.session_state.logs = room_state.get("logs", st.session_state.logs)
-        st.session_state.initialized = bool(st.session_state.portfolios)
-        st.session_state.num_groups = max(1, len(st.session_state.portfolios))
-    except Exception:
-        pass
-
-if not st.session_state.initialized:
-    if role == "Player":
-        st.info("Waiting for the Host to start the session…")
-        _autopoll(room_code)
-    else:
+# Load df/tickers each run from global state
+df = read_csv_df()
+tickers_all = state.get("tickers", [])
+if df is None or not tickers_all:
+    if role == "Host":
         st.info("Upload a CSV and click **Start/Reset** to begin.")
+    else:
+        st.info("Waiting for the Host to start the session.")
     st.stop()
 
-# CSV already loaded into df; ensure session keeps a copy for price lookups
-st.session_state.price_df = df.copy()
+# Pull most recent state values
+state = get_state()  # re-pull in case host just changed
+r = int(state.get("current_round", 0))
+rounds_total = int(state.get("rounds", 3))
+rng_seed = int(state.get("rng_seed", 1234))
+withdrawals = list(state.get("withdrawals", [0.0]*rounds_total))
+logs_global: Dict[str, List[dict]] = dict(state.get("logs", {}))
+portfolios = get_deserialized_portfolios()
+NG = int(state.get("num_groups", len(portfolios) or 1))
+tickers = tickers_all[:3]
 
-all_tickers = [c for c in df.columns if c != "date"]
-tickers = all_tickers[:3]  # show/use first 3
-r = st.session_state.current_round
-NG = max(1, int(st.session_state.get("num_groups", len(st.session_state.portfolios) or 1)))
-
-# ==== END-GAME GUARD (before any withdrawals[r] access) ====
-if r >= st.session_state.rounds:
+# ==== END-GAME GUARD ====
+if r >= rounds_total:
     st.header("Scoreboard & Logs")
-    _, final_px = base_prices_for_round(min(st.session_state.rounds-1, len(df)-1), df, tickers)
+    # final prices at last df row or last round
+    final_ix = min(rounds_total-1, len(df)-1)
+    _, final_px = str(df.loc[final_ix, "date"]), {t: float(df.loc[final_ix, t]) for t in tickers}
     rows = []
-    for p in st.session_state.portfolios:
+    for p in portfolios:
         s = p.summary(final_px)
         rows.append({
             "group": p.name,
@@ -517,7 +500,7 @@ if r >= st.session_state.rounds:
     st.dataframe(sb, use_container_width=True)
     st.download_button("Download scoreboard CSV", sb.to_csv(index=False).encode("utf-8"),
                        file_name="scoreboard.csv", mime="text/csv")
-    st.download_button("Download logs JSON", json.dumps(st.session_state.logs, indent=2).encode("utf-8"),
+    st.download_button("Download logs JSON", json.dumps(state.get("logs", {}), indent=2).encode("utf-8"),
                        file_name="logs.json", mime="application/json")
     st.stop()
 
@@ -526,31 +509,38 @@ date_str, prices = base_prices_for_round(r, df, tickers)
 repo_rate_today, td_rate_today = daily_rates_for_round(r)
 
 # Settle maturities once per round (repos/TDs maturing this round)
-if st.session_state.last_maturity_round != r:
-    for p in st.session_state.portfolios:
+if int(state.get("last_maturity_round", -1)) != r:
+    for p in portfolios:
         process_maturities(p, r)
-    st.session_state.last_maturity_round = r
+    # save portfolios & bump marker
+    set_serialized_portfolios(portfolios)
+    update_state(last_maturity_round=r)
 
 # Create same-withdrawal-for-all after maturities
-ensure_round_initialized(r, prices)
-req_all = float(st.session_state.withdrawals[r])
+withdrawals = ensure_round_initialized(r, prices, portfolios, rng_seed, rounds_total, withdrawals)
+if withdrawals != state.get("withdrawals", []):
+    update_state(withdrawals=withdrawals)
+
+req_all = float(withdrawals[r])
+claims = state.get("group_claims", {})
 
 # ------------------------
-# Handle queued Apply/Clear BEFORE widgets render
+# Apply / Clear handlers (permissioned)
 # ------------------------
-def _player_can_edit_group(g_index: int) -> bool:
-    if st.session_state.role == "Host":
+def _player_can_edit_group(index: int) -> bool:
+    if role == "Host":
         return True
-    return g_index == st.session_state.player_group_index
+    return claims.get(str(index)) == player_token
 
-if st.session_state.pending_apply is not None:
+# queued actions via widget callbacks
+if "pending_apply" in st.session_state and st.session_state.pending_apply is not None:
     g_apply = int(st.session_state.pending_apply["g"])
     r_apply = int(st.session_state.pending_apply["r"])
+    st.session_state.pending_apply = None
 
-    # Permission gate: only Host or the owning player may apply
-    if 0 <= g_apply < len(st.session_state.portfolios) and _player_can_edit_group(g_apply):
-        p = st.session_state.portfolios[g_apply]
-        rem_left = compute_remaining_for_group(p.name, r_apply, req_all)
+    if 0 <= g_apply < len(portfolios) and _player_can_edit_group(g_apply):
+        p = portfolios[g_apply]
+        rem_left = compute_remaining_for_group(p.name, r_apply, req_all, logs_global)
 
         # widget keys
         cash_key      = f"cash_{r_apply}_{g_apply}"
@@ -575,7 +565,7 @@ if st.session_state.pending_apply is not None:
         buy_tick   = st.session_state.get(buy_tick_key, "(none)")
 
         # current prices for displayed tickers
-        px = {t: float(st.session_state.price_df.loc[price_row_for_round(r_apply), t]) for t in tickers}
+        px = {t: float(df.loc[price_row_for_round(r_apply), t]) for t in tickers}
 
         history = []
 
@@ -659,15 +649,15 @@ if st.session_state.pending_apply is not None:
             }))
 
         if history:
-            st.session_state.logs[p.name].append({
+            logs_global.setdefault(p.name, []).append({
                 "round": r_apply + 1,
                 "request": req_all,
                 "actions": history
             })
 
-        # Persist changes so everyone sees them
-        replace_logs(room_code, st.session_state.logs)
-        set_room_portfolios(room_code, st.session_state.portfolios)
+        # Save portfolios/logs back to global
+        set_serialized_portfolios(portfolios)
+        replace_logs(logs_global)
 
         # Reset inputs BEFORE widgets render
         for key in [cash_key, repo_amt_key, redeem_key, invest_key, sell_qty_key, buy_qty_key]:
@@ -676,23 +666,21 @@ if st.session_state.pending_apply is not None:
         st.session_state[sell_tick_key] = "(none)"
         st.session_state[buy_tick_key]  = "(none)"
 
-    st.session_state.pending_apply = None
+        st.experimental_rerun()
 
-if st.session_state.pending_clear is not None:
+if "pending_clear" in st.session_state and st.session_state.pending_clear is not None:
     g_clear = int(st.session_state.pending_clear["g"])
     r_clear = int(st.session_state.pending_clear["r"])
+    st.session_state.pending_clear = None
 
-    # Permission gate
-    if 0 <= g_clear < len(st.session_state.portfolios) and _player_can_edit_group(g_clear):
-        p = st.session_state.portfolios[g_clear]
-        logs_this_round = [L for L in st.session_state.logs.get(p.name, []) if L["round"] == r_clear + 1]
+    if 0 <= g_clear < len(portfolios) and _player_can_edit_group(g_clear):
+        p = portfolios[g_clear]
+        logs_this_round = [L for L in logs_global.get(p.name, []) if L["round"] == r_clear + 1]
 
-        # Reverse each action conservatively
         for L in logs_this_round:
             for t, d in L["actions"]:
                 if t == "cash":
                     p.current_account += float(d.get("used", 0.0))
-
                 elif t == "repo":
                     got = float(d.get("got", 0.0))
                     use = float(d.get("use", 0.0))
@@ -705,7 +693,6 @@ if st.session_state.pending_clear is not None:
                         for i, l in enumerate(list(p.repo_liabilities)):
                             if abs(float(l.get("amount", 0.0)) - got) < 1e-6 and l.get("maturity", 10**9) > r_clear:
                                 p.repo_liabilities.pop(i); break
-
                 elif t == "redeem_td":
                     principal = float(d.get("principal", 0.0))
                     penalty   = float(d.get("penalty", 0.0))
@@ -722,7 +709,6 @@ if st.session_state.pending_clear is not None:
                             "rate": float(ch.get("rate", BASE_TD_RATE)),
                             "maturity": int(ch.get("maturity", r_clear + TD_MAT_GAP)),
                         })
-
                 elif t == "sell":
                     proceeds  = float(d.get("proceeds", 0.0))
                     use       = float(d.get("use", 0.0))
@@ -734,14 +720,12 @@ if st.session_state.pending_clear is not None:
                     if ticker is not None:
                         p.pos_qty[ticker] = p.pos_qty.get(ticker, 0.0) + qty
                     p.pnl_realized -= pnl_delta
-
                 elif t == "invest_td":
                     amt = float(d.get("amount", 0.0))
                     ids = set(d.get("td_ids", []))
                     p.current_account += amt
                     if ids:
                         p.td_assets = [a for a in p.td_assets if a.get("id") not in ids]
-
                 elif t == "buy":
                     cost   = float(d.get("cost", 0.0))
                     ticker = d.get("ticker")
@@ -751,48 +735,25 @@ if st.session_state.pending_clear is not None:
                         p.pos_qty[ticker] = p.pos_qty.get(ticker, 0.0) - qty
 
         # Drop those logs
-        st.session_state.logs[p.name] = [
-            L for L in st.session_state.logs.get(p.name, []) if L["round"] != r_clear + 1
-        ]
+        logs_global[p.name] = [L for L in logs_global.get(p.name, []) if L["round"] != r_clear + 1]
 
-        # Persist changes
-        replace_logs(room_code, st.session_state.logs)
-        set_room_portfolios(room_code, st.session_state.portfolios)
-
-        # Reset inputs BEFORE widgets render
-        for key in [
-            f"cash_{r_clear}_{g_clear}", f"repo_{r_clear}_{g_clear}",
-            f"redeemtd_{r_clear}_{g_clear}", f"sell_{r_clear}_{g_clear}",
-            f"investtd_{r_clear}_{g_clear}", f"buy_{r_clear}_{g_clear}"
-        ]:
-            st.session_state[key] = 0.0
-        st.session_state[f"repo_t_{r_clear}_{g_clear}"] = "(none)"
-        st.session_state[f"sell_t_{r_clear}_{g_clear}"] = "(none)"
-        st.session_state[f"buy_t_{r_clear}_{g_clear}"]  = "(none)"
-
-    st.session_state.pending_clear = None
+        # Save
+        set_serialized_portfolios(portfolios)
+        replace_logs(logs_global)
+        st.experimental_rerun()
 
 # ------------------------
-# Player group selection (after portfolios exist)
-# ------------------------
-if role == "Player" and st.session_state.portfolios:
-    available_groups = [p.name for p in st.session_state.portfolios]
-    default_idx = min(st.session_state.player_group_index, max(0, len(available_groups)-1))
-    player_group_name = st.sidebar.selectbox("My group", available_groups, index=default_idx)
-    st.session_state.player_group_index = available_groups.index(player_group_name)
-
-# ------------------------
-# Round dashboard (everyone can see, only own group is editable)
+# Round dashboard (everyone can see)
 # ------------------------
 st.subheader(f"Round {r+1} — Date: {date_str}")
 st.caption(f"Today’s rates → Repo: {repo_rate_today*100:.2f}%  •  TD: {td_rate_today*100:.2f}%  •  Early TD penalty: 1.00%")
 
 cols = st.columns(NG)
 for g, c in enumerate(cols):
-    if g >= len(st.session_state.portfolios): break
+    if g >= len(portfolios): break
     with c:
-        p = st.session_state.portfolios[g]
-        rem = compute_remaining_for_group(p.name, r, req_all)
+        p = portfolios[g]
+        rem = compute_remaining_for_group(p.name, r, req_all, logs_global)
         reserve = p.market_value(prices)
 
         st.markdown(f"### {p.name}")
@@ -805,22 +766,23 @@ for g, c in enumerate(cols):
                 f"<div class='ticker-line'>{t}: {p.pos_qty.get(t,0.0):,.0f} @ {prices[t]:,.2f}</div>",
                 unsafe_allow_html=True
             )
-        st.progress(max(0.0, 1 - rem/req_all if req_all > 0 else 1))
+        progress = max(0.0, 1 - rem/req_all) if req_all > 0 else 1.0
+        st.progress(progress)
 
 # ------------------------
 # Group tabs (inputs disabled unless Host or owning Player)
 # ------------------------
-tab_labels = [p.name for p in st.session_state.portfolios[:NG]]
+tab_labels = [p.name for p in portfolios[:NG]]
 tabs = st.tabs(tab_labels if tab_labels else ["Group 1"])
 for g, tab in enumerate(tabs):
-    if g >= len(st.session_state.portfolios): break
+    if g >= len(portfolios): break
     with tab:
-        p = st.session_state.portfolios[g]
-        rem = compute_remaining_for_group(p.name, r, req_all)
+        p = portfolios[g]
+        rem = compute_remaining_for_group(p.name, r, req_all, logs_global)
 
         editable = _player_can_edit_group(g)
-
-        st.markdown(f"### {p.name} {'(You)' if (role=='Player' and editable) else ''}")
+        owner = " (You)" if (role == "Player" and editable) else (" (Host)" if role == "Host" else "")
+        st.markdown(f"### {p.name}{owner}")
         summary = p.summary(prices)
         c1, c2, c3 = st.columns(3)
         with c1:
@@ -898,7 +860,7 @@ for g, tab in enumerate(tabs):
                         value=st.session_state.get(f"buy_{r}_{g}", 0.0),
                         format="%.2f", key=f"buy_{r}_{g}", disabled=not editable)
 
-        # Optional previews (read-only so always shown)
+        # Optional previews
         try:
             sell_sel = st.session_state.get(f"sell_t_{r}_{g}", "(none)")
             sell_q   = float(st.session_state.get(f"sell_{r}_{g}", 0.0) or 0.0)
@@ -919,11 +881,11 @@ for g, tab in enumerate(tabs):
         except Exception:
             pass
 
-        b1, b2 = st.columns([2,1])
-        b1.button("Apply action", key=f"apply_{r}_{g}",
+        cA, cB = st.columns([2,1])
+        cA.button("Apply action", key=f"apply_{r}_{g}",
                   on_click=lambda gg=g: st.session_state.update(pending_apply={"g": gg, "r": r}),
                   disabled=not editable)
-        b2.button("Clear Actions", key=f"clear_{r}_{g}",
+        cB.button("Clear Actions", key=f"clear_{r}_{g}",
                   on_click=lambda gg=g: st.session_state.update(pending_clear={"g": gg, "r": r}),
                   disabled=not editable)
 
@@ -936,31 +898,21 @@ with lft:
     st.subheader("Controls")
 
 all_covered = all(
-    compute_remaining_for_group(st.session_state.portfolios[i].name, r, req_all) <= 0.01
-    for i in range(min(NG, len(st.session_state.portfolios)))
+    compute_remaining_for_group(portfolios[i].name, r, req_all, logs_global) <= 0.01
+    for i in range(min(NG, len(portfolios)))
 )
 
 if role == "Host":
     with rgt:
-        st.button("Next Round ▶️", key=f"next_round_{r}",
-                  on_click=lambda: st.session_state.update(_next_round_clicked=True))
+        if st.button("Next Round ▶️", key=f"next_round_{r}"):
+            if not all_covered:
+                st.error("Cover all groups (remaining ≤ $0.01) before moving on.")
+            else:
+                if r + 1 < rounds_total:
+                    update_state(current_round=r+1, last_maturity_round=r)  # maturity will settle at next run
+                else:
+                    update_state(current_round=rounds_total)
+                st.experimental_rerun()
 else:
     with rgt:
         st.caption("Only the Host can advance rounds.")
-        _autopoll(room_code)  # players auto-refresh while waiting
-
-if st.session_state.get("_next_round_clicked", False):
-    st.session_state._next_round_clicked = False
-    if role != "Host":
-        st.error("Only the Host can advance rounds.")
-    else:
-        if not all_covered:
-            st.error("Cover all groups (remaining ≤ $0.01) before moving on.")
-        else:
-            if st.session_state.current_round + 1 < st.session_state.rounds:
-                st.session_state.current_round += 1
-            else:
-                st.session_state.current_round = st.session_state.rounds
-            # sync to room so players advance immediately
-            update_room(room_code, current_round=int(st.session_state.current_round))
-            st.rerun()
