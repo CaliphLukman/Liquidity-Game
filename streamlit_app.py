@@ -234,6 +234,8 @@ def _init_state():
     ss.player_group_name = ""   # <-- track by NAME
     ss.player_name = ""
     ss.live_preview_enabled = True  # always preview from current inputs
+    # Local, per-player overrides for instant reflection after Apply: {(round, group_name): {"summary":..., "positions":..., "remaining":...}}
+    ss.local_overrides: Dict[Tuple[int, str], Dict[str, Any]] = {}
 
 if "initialized" not in st.session_state:
     _init_state()
@@ -345,7 +347,7 @@ def _safe_buy(portfolio: Portfolio, ticker: str, qty: float, px: float) -> Dict[
 # Role selector (no auto-refresh)
 # ------------------------
 st.sidebar.markdown("### Session")
-role = st.sidebar.radio("Role", ["Host", "Player"], index=(0 if st.session_state.role == "Host" else 1))
+role = st.sidebar.radio("Role", ["Host", "Player"], index=(0 if st.session_state.role == "Host" else 1), key="role_radio")
 st.session_state.role = role
 
 # ------------------------
@@ -353,17 +355,17 @@ st.session_state.role = role
 # ------------------------
 if role == "Host":
     st.sidebar.header("Host Setup")
-    uploaded = st.sidebar.file_uploader("Bond price CSV (date + ≥3 securities)", type=["csv"])
-    seed = st.sidebar.number_input("RNG seed", value=st.session_state.rng_seed, step=1)
-    rounds = st.sidebar.number_input("Rounds", value=st.session_state.rounds, min_value=1, max_value=10, step=1)
-    groups = st.sidebar.number_input("Groups (up to 8)", value=st.session_state.num_groups, min_value=1, max_value=MAX_GROUPS_UI, step=1)
+    uploaded = st.sidebar.file_uploader("Bond price CSV (date + ≥3 securities)", type=["csv"], key="host_csv_upl")
+    seed = st.sidebar.number_input("RNG seed", value=st.session_state.rng_seed, step=1, key="host_seed")
+    rounds = st.sidebar.number_input("Rounds", value=st.session_state.rounds, min_value=1, max_value=10, step=1, key="host_rounds")
+    groups = st.sidebar.number_input("Groups (up to 8)", value=st.session_state.num_groups, min_value=1, max_value=MAX_GROUPS_UI, step=1, key="host_groups")
     c1, c2, c3 = st.sidebar.columns(3)
-    start_clicked = c1.button("Start/Reset", type="primary")
-    refresh_clicked = c2.button("Refresh status 🔄")
-    end_clicked   = c3.button("End Game")
+    start_clicked = c1.button("Start/Reset", type="primary", key="btn_start")
+    refresh_clicked = c2.button("Refresh status 🔄", key="btn_refresh")
+    end_clicked   = c3.button("End Game", key="btn_end")
 else:
     st.sidebar.header("Player Setup")
-    st.session_state.player_name = st.sidebar.text_input("Your name", value=st.session_state.player_name or "")
+    st.session_state.player_name = st.sidebar.text_input("Your name", value=st.session_state.player_name or "", key="player_name")
     uploaded = None
     start_clicked = refresh_clicked = end_clicked = False
     shared = _json_read(SHARED_STATE_PATH, {})
@@ -428,6 +430,7 @@ if role == "Host" and start_clicked:
             st.session_state.inited_rounds = set()
             st.session_state.player_group_index = 0
             st.session_state.player_group_name = ""
+            st.session_state.local_overrides = {}
 
             _json_write_atomic(ACTIONS_QUEUE_PATH, [])
             _json_write_atomic(SNAPSHOT_PATH, {
@@ -480,7 +483,8 @@ if role == "Player" and not st.session_state.initialized:
     st.session_state.logs = {}
     st.session_state.inited_rounds = set()
     st.session_state.last_maturity_round = -1
-    st.session_state.player_group_name = ""  # start empty
+    st.session_state.player_group_name = ""
+    st.session_state.local_overrides = {}
 
 # If still not initialized
 if not st.session_state.initialized:
@@ -497,10 +501,14 @@ if role == "Player":
         host_round = int(shared.get("current_round", st.session_state.current_round))
         if host_round != st.session_state.current_round:
             st.session_state.current_round = host_round
+            # Clear any stale overrides from older rounds
+            st.session_state.local_overrides = {
+                k: v for k, v in st.session_state.local_overrides.items() if k[0] == host_round
+            }
 
 df = st.session_state.price_df
 all_tickers = [c for c in df.columns if c != "date"]
-tickers_ui = all_tickers[:3]
+tickers_ui = all_tickers[:3]  # the 3 shown in UI
 r = st.session_state.current_round
 NG = max(1, int(st.session_state.get("num_groups", 1)))
 
@@ -512,6 +520,7 @@ prices_ui = {t: prices_all[t] for t in tickers_ui}
 # Host: settle maturities, ensure withdrawal, consume queue, publish snapshot
 # ------------------------
 def _host_publish_snapshot():
+    """Publish full round snapshot with per-group remaining to make Player UI richer & consistent."""
     micro: Dict[str, Dict[str, float]] = {}
     if st.session_state.portfolios:
         p0 = st.session_state.portfolios[0]
@@ -527,14 +536,15 @@ def _host_publish_snapshot():
                     micro[t] = {"bid_ask_bps": 0.0, "liquidity_score": 1.0}
             except Exception:
                 micro[t] = {"bid_ask_bps": 0.0, "liquidity_score": 1.0}
+
     groups_out = []
     req = float(st.session_state.withdrawals[r]) if r < len(st.session_state.withdrawals) else 0.0
     for p in st.session_state.portfolios:
-        s = p.summary(prices_all)
+        s = p.summary(prices_all)  # ALL tickers (for accurate totals)
         positions_ui = {t: float(p.pos_qty.get(t, 0.0)) for t in tickers_ui}
         remaining = compute_remaining_for_group(p.name, r, req)
         groups_out.append({
-            "name": p.name,
+            "name": p.name,                  # stable id by name to map actions
             "summary": {
                 "current_account": s["current_account"],
                 "securities_mv": s["securities_mv"],
@@ -544,7 +554,7 @@ def _host_publish_snapshot():
                 "total_mv": s["total_mv"],
             },
             "positions": positions_ui,
-            "remaining": remaining,
+            "remaining": remaining,          # host truth
         })
     _json_write_atomic(SNAPSHOT_PATH, {
         "round": r,
@@ -553,6 +563,7 @@ def _host_publish_snapshot():
         "withdrawal": req,
         "rates": list(daily_rates_for_round(r)),
         "micro": micro,
+        "published": True,
         "ts": _now_ts()
     })
 
@@ -807,13 +818,13 @@ if role == "Player":
             owner = claims.get(gname, "")
             st.caption(f"{gname}: {'(unclaimed)' if not owner else 'claimed by: ' + owner}")
 
-    # choose + claim (by NAME)
+    # choose + claim (by NAME) — persistent selectbox with a key so it won't reset to Group 1
     default_idx = group_names.index(st.session_state.player_group_name) if st.session_state.player_group_name in group_names else 0
-    chosen_name = st.sidebar.selectbox("Select your Group", group_names, index=default_idx)
+    chosen_name = st.sidebar.selectbox("Select your Group", group_names, index=default_idx, key="player_group_select")
     st.session_state.player_group_name = chosen_name  # persist the NAME
 
     can_claim = bool(st.session_state.player_name.strip())
-    if st.sidebar.button("Claim Group", disabled=not can_claim):
+    if st.sidebar.button("Claim Group", disabled=not can_claim, key="btn_claim"):
         def _try_claim(s):
             s = dict(s or {})
             s.setdefault("claims", {})
@@ -830,7 +841,7 @@ if role == "Player":
     you_own = claims.get(chosen_name, "") == st.session_state.player_name.strip()
 
 # ------------------------
-# Shared UI: dashboard
+# Shared UI: dashboard (top cards)
 # ------------------------
 repo_rate_today, td_rate_today = daily_rates_for_round(r)
 
@@ -859,34 +870,28 @@ else:
         if gi >= len(groups): break
         with c:
             G = groups[gi]
+            name = G["name"]
             s = G["summary"]
+            pos = G["positions"]
+            rem = float(G.get("remaining", 0.0))
 
-            # Live preview for your selected & claimed group using CURRENT inputs (no Apply needed)
-            if you_own and (G["name"] == st.session_state.player_group_name) and st.session_state.live_preview_enabled:
-                # read current input values (if widgets not created yet, they'll default to 0 later)
-                st.markdown(f"### {G['name']} (You — live preview)")
-                # we will show static here; detailed adjustments appear in the tab section below
-                # just mirror the host snapshot top card to avoid duplication
-                tot = s['total_mv']
-                st.markdown(f"<div style='font-size:28px; font-weight:800; color:#006400;'>{_fmt_money(tot,0)}</div>", unsafe_allow_html=True)
-                for t in tickers_ui:
-                    qty = float(G["positions"].get(t, 0.0))
-                    st.markdown(f"<div class='ticker-line'>{t}: {qty:,.0f}</div>", unsafe_allow_html=True)
-                group_rem = float(G.get("remaining", 0.0))
-                prog = 1.0 if req_all <= 0 else max(0.0, 1 - group_rem/req_all)
-                st.progress(prog)
-            else:
-                st.markdown(f"### {G['name']}")
-                st.markdown(f"<div style='font-size:28px; font-weight:800; color:#006400;'>{_fmt_money(s['total_mv'],0)}</div>", unsafe_allow_html=True)
-                for t in tickers_ui:
-                    qty = float(G["positions"].get(t, 0.0))
-                    st.markdown(f"<div class='ticker-line'>{t}: {qty:,.0f}</div>", unsafe_allow_html=True)
-                group_rem = float(G.get("remaining", 0.0))
-                prog = 1.0 if req_all <= 0 else max(0.0, 1 - group_rem/req_all)
-                st.progress(prog)
+            # Apply local override if present (immediate reflection after Apply)
+            override = st.session_state.local_overrides.get((r, name))
+            if override:
+                s = override.get("summary", s)
+                pos = override.get("positions", pos)
+                rem = override.get("remaining", rem)
+
+            st.markdown(f"### {name}{' (You)' if (role=='Player' and name==st.session_state.player_group_name and you_own) else ''}")
+            st.markdown(f"<div style='font-size:28px; font-weight:800; color:#006400;'>{_fmt_money(s['total_mv'],0)}</div>", unsafe_allow_html=True)
+            for t in tickers_ui:
+                qty = float(pos.get(t, 0.0))
+                st.markdown(f"<div class='ticker-line'>{t}: {qty:,.0f}</div>", unsafe_allow_html=True)
+            prog = 1.0 if req_all <= 0 else max(0.0, 1 - rem/req_all)
+            st.progress(prog)
 
 # ------------------------
-# Detailed tabs (Player shows live, Host shows authoritative)
+# Detailed tabs
 # ------------------------
 if role == "Host":
     req_all = float(st.session_state.withdrawals[r])
@@ -987,7 +992,7 @@ else:
                 sell_qty_eff = min(sell_qty, max_qty)
                 if sell_qty_eff > 0:
                     raw = float(prices_ui.get(sell_tick, 0.0))
-                    eff = _eff_price(sell_tick, "sell", raw, snapshot_micro)
+                    eff = _eff_price(sell_tick, "sell", raw, snapshot.get("micro", {}))
                     proceeds = sell_qty_eff * eff
                     pos[sell_tick] = max(0.0, pos.get(sell_tick, 0.0) - sell_qty_eff)
                     use_sell = min(proceeds, rem_host)
@@ -1003,7 +1008,7 @@ else:
             # buy
             if buy_tick != "(none)" and buy_qty > 0.0:
                 raw = float(prices_ui.get(buy_tick, 0.0))
-                eff = _eff_price(buy_tick, "buy", raw, snapshot_micro)
+                eff = _eff_price(buy_tick, "buy", raw, snapshot.get("micro", {}))
                 if eff > 0:
                     qty_afford = min(buy_qty, max(0.0, s["current_account"]) / eff)
                 else:
@@ -1033,10 +1038,21 @@ else:
         for gi, tab in enumerate(tabs):
             with tab:
                 G = groups[gi]
+                name = G["name"]
                 s = G["summary"]
-                is_yours = you_own and (G["name"] == st.session_state.player_group_name)
+                pos = G["positions"]
+                rem_host = float(G.get("remaining", 0.0))
 
-                st.markdown(f"### {G['name']}{' (You)' if is_yours else ''}")
+                # Apply local override (so the tab metrics also reflect immediately after Apply)
+                override = st.session_state.local_overrides.get((r, name))
+                if override:
+                    s = override.get("summary", s)
+                    pos = override.get("positions", pos)
+                    rem_host = override.get("remaining", rem_host)
+
+                is_yours = you_own and (name == st.session_state.player_group_name)
+
+                st.markdown(f"### {name}{' (You)' if is_yours else ''}")
 
                 keys = _keys_for(gi)
 
@@ -1075,7 +1091,7 @@ else:
                         sell_q   = float(st.session_state.get(keys["sell_qty"], 0.0) or 0.0)
                         if sell_sel != "(none)" and sell_q > 0:
                             raw = float(prices_ui.get(sell_sel, 0.0))
-                            eff = _eff_price(sell_sel, "sell", raw, snapshot_micro)
+                            eff = _eff_price(sell_sel, "sell", raw, snapshot.get("micro", {}))
                             st.caption(f"Sell Preview: {sell_q:,.2f} × {_fmt_money(eff)} = {_fmt_money(sell_q*eff)}")
                         else:
                             st.caption("Sell Preview: —")
@@ -1095,7 +1111,7 @@ else:
                         buy_q   = float(st.session_state.get(keys["buy_qty"], 0.0) or 0.0)
                         if buy_sel != "(none)" and buy_q > 0:
                             raw = float(prices_ui.get(buy_sel, 0.0))
-                            eff = _eff_price(buy_sel, "buy", raw, snapshot_micro)
+                            eff = _eff_price(buy_sel, "buy", raw, snapshot.get("micro", {}))
                             st.caption(f"Buy Preview: {buy_q:,.2f} × {_fmt_money(eff)} = {_fmt_money(buy_q*eff)}")
                         else:
                             st.caption("Buy Preview: —")
@@ -1115,24 +1131,41 @@ else:
                         "buy_tick":  st.session_state.get(keys["buy_tick"], "(none)"),
                     }
 
-                    # Live adjusted summary/positions/remaining
-                    s_eff, pos_eff, rem_eff = _apply_inputs_preview(G, current_inputs, req_all)
+                    # Live adjusted summary/positions/remaining (preview)
+                    s_eff_preview, pos_eff_preview, rem_eff_preview = _apply_inputs_preview(G, current_inputs, req_all)
+
+                    # If there is a local override (i.e., from a previous Apply), use it as the base,
+                    # then show what current typing would do to that base
+                    base_for_display = st.session_state.local_overrides.get((r, name))
+                    if base_for_display:
+                        G_base = {
+                            "summary": base_for_display["summary"],
+                            "positions": base_for_display["positions"],
+                            "remaining": base_for_display["remaining"],
+                        }
+                        s_eff_preview, pos_eff_preview, rem_eff_preview = _apply_inputs_preview(G_base, current_inputs, req_all)
+
+                    # Show metrics using the preview values
                     c1, c2, c3 = st.columns(3)
                     with c1:
-                        st.metric("Current Account",        _fmt_money(s_eff['current_account']))
-                        st.metric("Repo Outstanding",       _fmt_money(s_eff['repo_outstanding']))
+                        st.metric("Current Account",        _fmt_money(s_eff_preview['current_account']))
+                        st.metric("Repo Outstanding",       _fmt_money(s_eff_preview['repo_outstanding']))
                     with c2:
-                        st.metric("Securities Reserve",     _fmt_money(s_eff['securities_mv']))
-                        st.metric("Term Deposit (Asset)",   _fmt_money(s_eff['td_invested']))
+                        st.metric("Securities Reserve",     _fmt_money(s_eff_preview['securities_mv']))
+                        st.metric("Term Deposit (Asset)",   _fmt_money(s_eff_preview['td_invested']))
                     with c3:
                         st.metric("PnL Realized",           _fmt_money(s.get('pnl_realized', 0.0)))
-                        st.metric("Total Reserve",          _fmt_money(s_eff['total_mv']))
+                        st.metric("Total Reserve",          _fmt_money(s_eff_preview['total_mv']))
 
                     st.markdown(f"**Withdrawal (all groups):** :blue[{_fmt_money(req_all)}]")
-                    st.markdown(f"**Remaining (you, now):** :green[{_fmt_money(rem_eff)}]  —  **Host snapshot:** :orange[{_fmt_money(float(G.get('remaining', 0.0)))}]")
+                    st.markdown(f"**Remaining (you, now):** :green[{_fmt_money(rem_eff_preview)}]  —  **Host snapshot:** :orange[{_fmt_money(float(G.get('remaining', 0.0)))}]")
 
                     # Apply/Clear
                     def _enqueue(a_type: str):
+                        # Compute the *committed* effect to store locally for immediate reflection
+                        s_committed, pos_committed, rem_committed = _apply_inputs_preview(
+                            base_for_display or G, current_inputs, req_all
+                        )
                         action = {
                             "ts": _now_ts(),
                             "type": a_type,
@@ -1142,25 +1175,36 @@ else:
                             "inputs": current_inputs
                         }
                         _json_mutate(ACTIONS_QUEUE_PATH, [], lambda q: (q if isinstance(q, list) else []) + [action])
+
                         if a_type == "apply":
-                            # zero out entry fields locally
+                            # Store local override so dashboards/tabs reflect instantly
+                            st.session_state.local_overrides[(r, name)] = {
+                                "summary": s_committed,
+                                "positions": pos_committed,
+                                "remaining": rem_committed,
+                            }
+                            # Clear input widgets
                             for k in keys.values():
-                                if k.endswith(("_tick")):
+                                if k.endswith("_tick"):
+                                    st.session_state[k] = "(none)"
+                                else:
+                                    st.session_state[k] = 0.0
+                        elif a_type == "clear":
+                            # Remove local override
+                            st.session_state.local_overrides.pop((r, name), None)
+                            # Also clear inputs
+                            for k in keys.values():
+                                if k.endswith("_tick"):
                                     st.session_state[k] = "(none)"
                                 else:
                                     st.session_state[k] = 0.0
 
                     b1, b2 = st.columns([2,1])
-                    b1.button("Apply Action", on_click=lambda: _enqueue("apply"))
-                    b2.button("Clear Actions", on_click=lambda: _enqueue("clear"))
-
-                    # Show adjusted positions (quantities)
-                    st.markdown("#### Your holdings (live)")
-                    for t in tickers_ui:
-                        st.markdown(f"- **{t}**: {pos_eff.get(t,0.0):,.2f}")
+                    b1.button("Apply Action", on_click=lambda: _enqueue("apply"), key=f"apply_{r}_{gi}")
+                    b2.button("Clear Actions", on_click=lambda: _enqueue("clear"), key=f"clear_{r}_{gi}")
 
                 else:
-                    # Read-only view for other groups
+                    # Read-only view for other groups (apply override if present so they see their own latest local state if browsing)
                     c1, c2, c3 = st.columns(3)
                     with c1:
                         st.metric("Current Account",        _fmt_money(s['current_account']))
@@ -1172,7 +1216,7 @@ else:
                         st.metric("PnL Realized",           _fmt_money(s['pnl_realized']))
                         st.metric("Total Reserve",          _fmt_money(s['total_mv']))
                     st.markdown(f"**Withdrawal (all groups):** :blue[{_fmt_money(req_all)}]")
-                    st.markdown(f"**Remaining (host):** :orange[{_fmt_money(float(G.get('remaining', 0.0)))}]")
+                    st.markdown(f"**Remaining (host):** :orange[{_fmt_money(rem_host)}]")
                     st.caption("Read-only (not your claimed group).")
 
 # ------------------------
@@ -1184,7 +1228,7 @@ with lft: st.subheader("Controls")
 
 if st.session_state.role == "Host":
     with rgt:
-        if st.button("Next Round ▶️"):
+        if st.button("Next Round ▶️", key="btn_next_round"):
             req_all = float(st.session_state.withdrawals[r])
             all_covered = all(
                 compute_remaining_for_group(st.session_state.portfolios[i].name, r, req_all) <= 0.01
