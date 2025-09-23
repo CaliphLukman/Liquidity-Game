@@ -665,7 +665,7 @@ def _host_apply_single_action(p: Portfolio, req_all: float, px_ui: Dict[str, flo
             history.append(("repo", {
                 "ticker": repo_tick, "got": round(got, 2), "use": round(use, 2),
                 "repo_id": info["repo_id"], "rate": repo_rate
-            }))}
+            }))
     # 3) redeem td
     if redeem_amt > 0 and rem_left > 0:
         red = _safe_redeem_td(p, redeem_amt, r)
@@ -1292,3 +1292,4 @@ elif st.session_state.role == "Player":
     shared = _json_read(SHARED_STATE_PATH, {})
     if int(shared.get("current_round", 0)) >= int(shared.get("rounds", st.session_state.rounds)):
         st.header("Game finished — waiting for host to display final results.")
+
