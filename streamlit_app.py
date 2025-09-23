@@ -365,7 +365,7 @@ if role == "Host":
     end_clicked   = c3.button("End Game", key="btn_end")
 else:
     st.sidebar.header("Player Setup")
-    st.session_state.player_name = st.sidebar.text_input("Your name", value=st.session_state.player_name or "", key="player_name")
+    st.sidebar.text_input("Your name", value=st.session_state.get("player_name", ""), key="player_name")
     uploaded = None
     start_clicked = refresh_clicked = end_clicked = False
     shared = _json_read(SHARED_STATE_PATH, {})
@@ -1259,3 +1259,4 @@ elif st.session_state.role == "Player":
     shared = _json_read(SHARED_STATE_PATH, {})
     if int(shared.get("current_round", 0)) >= int(shared.get("rounds", st.session_state.rounds)):
         st.header("Game finished — waiting for host to display final results.")
+
