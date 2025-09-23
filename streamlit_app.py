@@ -370,6 +370,42 @@ def _apply_staged_deltas_to_summary(base_summary: dict, base_positions: dict, st
     
     return new_summary, new_positions
 
+# Helper function for staged consumption estimate (moved here before usage)
+def _estimate_used_from_inputs(group_payload: dict, inputs: Dict[str, float], prices: Dict[str, float]) -> float:
+    """Approximate 'use' toward withdrawal from the current staged inputs."""
+    s = group_payload["summary"]
+    pos = group_payload["positions"]
+    used = 0.0
+    
+    # 1) cash
+    cash = max(0.0, float(inputs.get("cash", 0.0)))
+    used += min(cash, max(0.0, float(s["current_account"])))
+    
+    # 2) repo
+    repo_amt = max(0.0, float(inputs.get("repo_amt", 0.0)))
+    repo_tick = inputs.get("repo_tick", "(none)")
+    if repo_tick != "(none)" and repo_tick in prices:
+        px = float(prices[repo_tick])
+        collateral_cap = max(0.0, float(pos.get(repo_tick, 0.0))) * px
+        used += min(repo_amt, collateral_cap)
+    
+    # 3) redeem TD
+    redeem = max(0.0, float(inputs.get("redeem", 0.0)))
+    td_invested = max(0.0, float(s["td_invested"]))
+    redeem_actual = min(redeem, td_invested)
+    penalty = redeem_actual * TD_PENALTY
+    used += max(0.0, redeem_actual - penalty)
+    
+    # 4) sell
+    sell_qty = max(0.0, float(inputs.get("sell_qty", 0.0)))
+    sell_tick = inputs.get("sell_tick", "(none)")
+    if sell_tick != "(none)" and sell_tick in prices:
+        pxs = calculate_effective_price_with_spread(float(prices[sell_tick]), False)
+        max_qty = max(0.0, float(pos.get(sell_tick, 0.0)))
+        used += min(sell_qty, max_qty) * pxs
+    
+    return used
+
 # ---- safe adapters
 def _safe_repo_call(portfolio: Portfolio, ticker: str, amount: float, price: float, rnow: int, rate: float) -> Dict[str, Any]:
     got, repo_id = 0.0, None
@@ -983,46 +1019,10 @@ else:
             # Progress bar - use base remaining minus any staged consumption
             group_rem = float(G.get("remaining", 0.0))
             if you_own_this and staged_inputs:
-                staged_used = _estimate_used_from_inputs(G, staged_inputs)
+                staged_used = _estimate_used_from_inputs(G, staged_inputs, prices_ui)
                 group_rem = max(0.0, group_rem - staged_used)
             prog = 1.0 if req_all <= 0 else max(0.0, 1 - group_rem/req_all)
             st.progress(prog)
-
-# Helper function for staged consumption estimate
-def _estimate_used_from_inputs(group_payload: dict, inputs: Dict[str, float]) -> float:
-    """Approximate 'use' toward withdrawal from the current staged inputs."""
-    s = group_payload["summary"]
-    pos = group_payload["positions"]
-    used = 0.0
-    
-    # 1) cash
-    cash = max(0.0, float(inputs.get("cash", 0.0)))
-    used += min(cash, max(0.0, float(s["current_account"])))
-    
-    # 2) repo
-    repo_amt = max(0.0, float(inputs.get("repo_amt", 0.0)))
-    repo_tick = inputs.get("repo_tick", "(none)")
-    if repo_tick != "(none)" and repo_tick in prices_ui:
-        px = float(prices_ui[repo_tick])
-        collateral_cap = max(0.0, float(pos.get(repo_tick, 0.0))) * px
-        used += min(repo_amt, collateral_cap)
-    
-    # 3) redeem TD
-    redeem = max(0.0, float(inputs.get("redeem", 0.0)))
-    td_invested = max(0.0, float(s["td_invested"]))
-    redeem_actual = min(redeem, td_invested)
-    penalty = redeem_actual * TD_PENALTY
-    used += max(0.0, redeem_actual - penalty)
-    
-    # 4) sell
-    sell_qty = max(0.0, float(inputs.get("sell_qty", 0.0)))
-    sell_tick = inputs.get("sell_tick", "(none)")
-    if sell_tick != "(none)" and sell_tick in prices_ui:
-        pxs = calculate_effective_price_with_spread(float(prices_ui[sell_tick]), False)
-        max_qty = max(0.0, float(pos.get(sell_tick, 0.0)))
-        used += min(sell_qty, max_qty) * pxs
-    
-    return used
 
 # ------------------------
 # Detailed tabs
@@ -1076,7 +1076,7 @@ else:
                 # Calculate adjusted state
                 if you_own_this_group and staged_inputs:
                     s, pos = _apply_staged_deltas_to_summary(base_s, base_pos, staged_inputs, prices_ui, r)
-                    staged_used = _estimate_used_from_inputs(G, staged_inputs)
+                    staged_used = _estimate_used_from_inputs(G, staged_inputs, prices_ui)
                     rem_effective = max(0.0, rem_host - staged_used)
                 else:
                     s, pos = base_s, base_pos
