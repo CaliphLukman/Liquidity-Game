@@ -3,7 +3,7 @@ import os
 import json
 import time
 import random
-from typing import List, Dict, Tuple, Any
+from typing import List, Dict, Tuple, Any, Optional
 
 import pandas as pd
 import streamlit as st
@@ -168,7 +168,7 @@ MAX_GROUPS_UI  = 8
 # Simple file-based sync (single game, no DB)
 SHARED_STATE_PATH   = ".shared_state.json"   # host pushes session info + claims + current_round
 UPLOADED_CSV_PATH   = ".uploaded.csv"        # host saves CSV here
-ACTIONS_QUEUE_PATH  = ".actions_queue.json"  # players enqueue actions: {"type": "apply"|"clear", ...}
+ACTIONS_QUEUE_PATH  = ".actions_queue.json"  # players enqueue actions
 SNAPSHOT_PATH       = ".snapshot.json"       # host publishes live snapshot for all
 
 # ------------------------
@@ -207,6 +207,12 @@ def _json_mutate(path: str, default, fn):
 def _now_ts() -> float:
     return time.time()
 
+def _fmt_money(x: float, nd: int = 2) -> str:
+    try:
+        return f"${x:,.{nd}f}"
+    except Exception:
+        return f"${x}"
+
 # ------------------------
 # Session State bootstrap
 # ------------------------
@@ -226,6 +232,8 @@ def _init_state():
     ss.role = "Host"
     ss.player_group_index = 0
     ss.player_name = ""
+    # Player-side: keep a local staged "delta" to reflect actions immediately
+    ss.staged_inputs: Dict[str, Dict[str, Any]] = {}  # key=f"r{r}_group_{name}"
 
 if "initialized" not in st.session_state:
     _init_state()
@@ -272,7 +280,7 @@ def compute_remaining_for_group(group_name: str, r: int, req_for_round: float) -
                 used += float(d.get("use", 0.0))
     return max(0.0, round(req_for_round - used, 2))
 
-# safe adapters
+# ---- safe adapters
 def _safe_repo_call(portfolio: Portfolio, ticker: str, amount: float, price: float, rnow: int, rate: float) -> Dict[str, Any]:
     got, repo_id = 0.0, None
     try:
@@ -423,10 +431,10 @@ if role == "Host" and start_clicked:
             st.session_state.inited_rounds = set()
             st.session_state.player_group_index = 0
 
-            # Clear queue & claims
+            # Clear queue
             _json_write_atomic(ACTIONS_QUEUE_PATH, [])
 
-            # ✅ Publish a minimal snapshot marker so Players stop seeing "waiting..."
+            # ✅ Minimal snapshot marker so players leave "waiting..." immediately
             _json_write_atomic(SNAPSHOT_PATH, {
                 "published": True,
                 "ts": _now_ts()
@@ -511,12 +519,15 @@ prices_ui = {t: prices_all[t] for t in tickers_ui}
 # Host: settle maturities, ensure withdrawal, consume queue, publish snapshot
 # ------------------------
 def _host_publish_snapshot():
+    """Publish full round snapshot with per-group remaining to make Player UI richer & consistent."""
     groups_out = []
+    req = float(st.session_state.withdrawals[r]) if r < len(st.session_state.withdrawals) else 0.0
     for p in st.session_state.portfolios:
-        s = p.summary(prices_all)  # ALL tickers
-        positions = {t: float(p.pos_qty.get(t, 0.0)) for t in tickers_ui}
+        s = p.summary(prices_all)  # ALL tickers (for accurate totals)
+        positions_ui = {t: float(p.pos_qty.get(t, 0.0)) for t in tickers_ui}
+        remaining = compute_remaining_for_group(p.name, r, req)
         groups_out.append({
-            "name": p.name,
+            "name": p.name,                  # stable id by name to map actions
             "summary": {
                 "current_account": s["current_account"],
                 "securities_mv": s["securities_mv"],
@@ -525,13 +536,14 @@ def _host_publish_snapshot():
                 "pnl_realized": s["pnl_realized"],
                 "total_mv": s["total_mv"],
             },
-            "positions": positions
+            "positions": positions_ui,
+            "remaining": remaining,          # NEW: remaining for this round (host truth)
         })
     _json_write_atomic(SNAPSHOT_PATH, {
         "round": r,
         "tickers": tickers_ui,
         "groups": groups_out,
-        "withdrawal": float(st.session_state.withdrawals[r]) if r < len(st.session_state.withdrawals) else 0.0,
+        "withdrawal": req,
         "rates": list(daily_rates_for_round(r)),
         "ts": _now_ts()
     })
@@ -692,23 +704,29 @@ def _host_apply_single_action(p: Portfolio, req_all: float, px_ui: Dict[str, flo
             "actions": history
         })
 
+def _find_portfolio_index_by_name(name: str) -> Optional[int]:
+    for i, p in enumerate(st.session_state.portfolios):
+        if p.name == name:
+            return i
+    return None
+
 def _host_consume_actions_and_publish(req_all: float):
     actions = _json_read(ACTIONS_QUEUE_PATH, [])
     if not isinstance(actions, list):
         actions = []
     if actions:
         for a in actions:
-            gi = int(a.get("group_index", -1))
             rr = int(a.get("round", -1))
             a_type = a.get("type", "apply")
-            if rr != r:  # only current round
+            gname = a.get("group_name", "")
+            gi = _find_portfolio_index_by_name(gname)  # <-- map by NAME (fixes 'always group 4' bug)
+            if rr != r or gi is None:
                 continue
-            if 0 <= gi < len(st.session_state.portfolios):
-                p = st.session_state.portfolios[gi]
-                if a_type == "apply":
-                    _host_apply_single_action(p, req_all, prices_ui, a.get("inputs", {}))
-                elif a_type == "clear":
-                    _reverse_actions_for_round(p, rr)
+            p = st.session_state.portfolios[gi]
+            if a_type == "apply":
+                _host_apply_single_action(p, req_all, prices_ui, a.get("inputs", {}))
+            elif a_type == "clear":
+                _reverse_actions_for_round(p, rr)
         _json_write_atomic(ACTIONS_QUEUE_PATH, [])
     _host_publish_snapshot()
 
@@ -760,7 +778,7 @@ if role == "Host":
 if role == "Player":
     shared = _json_read(SHARED_STATE_PATH, {})
     snapshot = _json_read(SNAPSHOT_PATH, {})
-    if not snapshot:
+    if not snapshot or not isinstance(snapshot, dict) or not snapshot.get("published") and not snapshot.get("groups"):
         st.info("Waiting for Host to publish the round snapshot…")
         st.stop()
 
@@ -820,10 +838,11 @@ if role == "Host":
             rem = compute_remaining_for_group(p.name, r, float(st.session_state.withdrawals[r]))
             reserve = p.market_value(prices_all)
             st.markdown(f"### {p.name}")
-            st.markdown(f"<div style='font-size:28px; font-weight:800; color:#006400;'>${reserve:,.0f}</div>", unsafe_allow_html=True)
+            st.markdown(f"<div style='font-size:28px; font-weight:800; color:#006400;'>{_fmt_money(reserve,0)}</div>", unsafe_allow_html=True)
             for t in tickers_ui:
-                st.markdown(f"<div class='ticker-line'>{t}: {p.pos_qty.get(t,0.0):,.0f} @ {prices_ui[t]:,.2f}</div>", unsafe_allow_html=True)
-            st.progress(max(0.0, 1 - rem/float(st.session_state.withdrawals[r]) if float(st.session_state.withdrawals[r]) > 0 else 1))
+                st.markdown(f"<div class='ticker-line'>{t}: {p.pos_qty.get(t,0.0):,.0f} @ {_fmt_money(prices_ui[t])}</div>", unsafe_allow_html=True)
+            prog = 0.0 if float(st.session_state.withdrawals[r]) <= 0 else max(0.0, 1 - rem/float(st.session_state.withdrawals[r]))
+            st.progress(prog)
 else:
     snapshot = _json_read(SNAPSHOT_PATH, {})
     groups = snapshot.get("groups", [])
@@ -834,11 +853,14 @@ else:
             G = groups[g]
             s = G["summary"]
             st.markdown(f"### {G['name']}")
-            st.markdown(f"<div style='font-size:28px; font-weight:800; color:#006400;'>${s['total_mv']:,.0f}</div>", unsafe_allow_html=True)
+            st.markdown(f"<div style='font-size:28px; font-weight:800; color:#006400;'>{_fmt_money(s['total_mv'],0)}</div>", unsafe_allow_html=True)
             for t in tickers_ui:
                 qty = float(G["positions"].get(t, 0.0))
                 st.markdown(f"<div class='ticker-line'>{t}: {qty:,.0f}</div>", unsafe_allow_html=True)
-            st.progress(1.0 if req_all <= 0 else 0.0)
+            # Use host-provided remaining
+            group_rem = float(G.get("remaining", 0.0))
+            prog = 1.0 if req_all <= 0 else max(0.0, 1 - group_rem/req_all)
+            st.progress(prog)
 
 # ------------------------
 # Detailed tabs
@@ -856,16 +878,16 @@ if role == "Host":
             summary = p.summary(prices_all)
             c1, c2, c3 = st.columns(3)
             with c1:
-                st.metric("Current Account",        f"{summary['current_account']:,.2f}")
-                st.metric("Repo Outstanding",       f"{summary['repo_outstanding']:,.2f}")
+                st.metric("Current Account",        _fmt_money(summary['current_account']))
+                st.metric("Repo Outstanding",       _fmt_money(summary['repo_outstanding']))
             with c2:
-                st.metric("Securities Reserve",     f"{summary['securities_mv']:,.2f}")
-                st.metric("Term Deposit (Asset)",   f"{summary['td_invested']:,.2f}")
+                st.metric("Securities Reserve",     _fmt_money(summary['securities_mv']))
+                st.metric("Term Deposit (Asset)",   _fmt_money(summary['td_invested']))
             with c3:
-                st.metric("PnL Realized",           f"{summary['pnl_realized']:,.2f}")
-                st.metric("Total Reserve",          f"{summary['total_mv']:,.2f}")
-            st.markdown(f"**Withdrawal (all groups):** :blue[{req_all:,.2f}]")
-            st.markdown(f"**Remaining for {p.name}:** :orange[{rem:,.2f}]")
+                st.metric("PnL Realized",           _fmt_money(summary['pnl_realized']))
+                st.metric("Total Reserve",          _fmt_money(summary['total_mv']))
+            st.markdown(f"**Withdrawal (all groups):** :blue[{_fmt_money(req_all)}]")
+            st.markdown(f"**Remaining for {p.name}:** :orange[{_fmt_money(rem)}]")
 else:
     snapshot = _json_read(SNAPSHOT_PATH, {})
     groups = snapshot.get("groups", [])
@@ -877,22 +899,64 @@ else:
         claims = shared.get("claims", {})
         you_own = claims.get(chosen_name, "") == st.session_state.player_name.strip()
 
+        # Helper: estimate how much the player's staged inputs would cover now (for instant reflection)
+        def _estimate_used_from_inputs(group_payload: dict, inputs: Dict[str, float]) -> float:
+            """Approximate 'use' toward withdrawal from the current staged inputs."""
+            s = group_payload["summary"]
+            pos = group_payload["positions"]
+            used = 0.0
+            # 1) cash
+            cash = max(0.0, float(inputs.get("cash", 0.0)))
+            used += min(cash, max(0.0, float(s["current_account"])))
+            # 2) repo
+            repo_amt = max(0.0, float(inputs.get("repo_amt", 0.0)))
+            repo_tick = inputs.get("repo_tick", "(none)")
+            if repo_tick != "(none)":
+                px = float(prices_ui.get(repo_tick, 0.0))
+                collateral_cap = max(0.0, float(pos.get(repo_tick, 0.0))) * px
+                used += min(repo_amt, collateral_cap)
+            # 3) redeem TD
+            redeem = max(0.0, float(inputs.get("redeem", 0.0)))
+            td_invested = max(0.0, float(s["td_invested"]))
+            used += min(redeem, td_invested)
+            # 4) sell
+            sell_qty = max(0.0, float(inputs.get("sell_qty", 0.0)))
+            sell_tick = inputs.get("sell_tick", "(none)")
+            if sell_tick != "(none)":
+                pxs = float(prices_ui.get(sell_tick, 0.0))
+                max_qty = max(0.0, float(pos.get(sell_tick, 0.0)))
+                used += min(sell_qty, max_qty) * pxs
+            # buy / invest_td do not cover withdrawals
+            return used
+
         for gi, tab in enumerate(tabs):
             with tab:
                 G = groups[gi]
                 s = G["summary"]
+                rem_host = float(G.get("remaining", 0.0))
+
                 st.markdown(f"### {G['name']}{' (You)' if (gi==chosen_idx and you_own) else ''}")
                 c1, c2, c3 = st.columns(3)
                 with c1:
-                    st.metric("Current Account",        f"{s['current_account']:,.2f}")
-                    st.metric("Repo Outstanding",       f"{s['repo_outstanding']:,.2f}")
+                    st.metric("Current Account",        _fmt_money(s['current_account']))
+                    st.metric("Repo Outstanding",       _fmt_money(s['repo_outstanding']))
                 with c2:
-                    st.metric("Securities Reserve",     f"{s['securities_mv']:,.2f}")
-                    st.metric("Term Deposit (Asset)",   f"{s['td_invested']:,.2f}")
+                    st.metric("Securities Reserve",     _fmt_money(s['securities_mv']))
+                    st.metric("Term Deposit (Asset)",   _fmt_money(s['td_invested']))
                 with c3:
-                    st.metric("PnL Realized",           f"{s['pnl_realized']:,.2f}")
-                    st.metric("Total Reserve",          f"{s['total_mv']:,.2f}")
-                st.markdown(f"**Withdrawal (all groups):** :blue[{snapshot.get('withdrawal', 0.0):,.2f}]")
+                    st.metric("PnL Realized",           _fmt_money(s['pnl_realized']))
+                    st.metric("Total Reserve",          _fmt_money(s['total_mv']))
+
+                # --- Withdrawal + Remaining (shows host value + instant staged adjustment if this is your claimed group)
+                staged_key = f"r{r}_group_{G['name']}"
+                staged_inputs = st.session_state.staged_inputs.get(staged_key, {})
+                staged_used = 0.0
+                if gi == chosen_idx and you_own and staged_inputs:
+                    staged_used = _estimate_used_from_inputs(G, staged_inputs)
+                rem_effective = max(0.0, rem_host - staged_used)
+
+                st.markdown(f"**Withdrawal (all groups):** :blue[{_fmt_money(snapshot.get('withdrawal', 0.0))}]")
+                st.markdown(f"**Remaining (host):** :orange[{_fmt_money(rem_host)}]" + ("" if staged_used <= 0 else f"  → **Your staged**: :green[-{_fmt_money(staged_used)}]  **= Now:** :green[{_fmt_money(rem_effective)}]"))
 
                 # Inputs ONLY on your own claimed group; others read-only
                 if gi == chosen_idx and you_own:
@@ -929,25 +993,31 @@ else:
                     st.selectbox("Buy ticker", ["(none)"] + tickers_ui, index=(["(none)"] + tickers_ui).index(st.session_state.get(buy_tick_key, "(none)")), key=buy_tick_key)
                     st.number_input("Buy qty", min_value=0.0, step=0.01, value=st.session_state.get(buy_qty_key, 0.0), format="%.2f", key=buy_qty_key)
 
+                    def _collect_current_inputs() -> Dict[str, Any]:
+                        return {
+                            "cash":      get_float(cash_key),
+                            "repo_amt":  get_float(repo_amt_key),
+                            "repo_tick": st.session_state.get(repo_tick_key, "(none)"),
+                            "redeem":    get_float(redeem_key),
+                            "invest_td": get_float(invest_key),
+                            "sell_qty":  get_float(sell_qty_key),
+                            "sell_tick": st.session_state.get(sell_tick_key, "(none)"),
+                            "buy_qty":   get_float(buy_qty_key),
+                            "buy_tick":  st.session_state.get(buy_tick_key, "(none)")
+                        }
+
                     def _enqueue_player_action(a_type: str):
+                        inputs = _collect_current_inputs()
+                        # Keep local staged for instant UI reflection
+                        st.session_state.staged_inputs[staged_key] = inputs if a_type == "apply" else {}
+                        # Enqueue by NAME (not index) to avoid mismatches on Host
                         action = {
                             "ts": _now_ts(),
                             "type": a_type,  # "apply" or "clear"
                             "by": st.session_state.player_name.strip(),
-                            "group_index": gi,
                             "group_name": G["name"],
                             "round": r,
-                            "inputs": {
-                                "cash":      get_float(cash_key),
-                                "repo_amt":  get_float(repo_amt_key),
-                                "repo_tick": st.session_state.get(repo_tick_key, "(none)"),
-                                "redeem":    get_float(redeem_key),
-                                "invest_td": get_float(invest_key),
-                                "sell_qty":  get_float(sell_qty_key),
-                                "sell_tick": st.session_state.get(sell_tick_key, "(none)"),
-                                "buy_qty":   get_float(buy_qty_key),
-                                "buy_tick":  st.session_state.get(buy_tick_key, "(none)")
-                            }
+                            "inputs": inputs
                         }
                         _json_mutate(ACTIONS_QUEUE_PATH, [], lambda q: (q if isinstance(q, list) else []) + [action])
                         if a_type == "apply":
@@ -957,6 +1027,7 @@ else:
                             for k in [repo_tick_key, sell_tick_key, buy_tick_key]:
                                 st.session_state[k] = "(none)"
 
+                    # Buttons
                     b1, b2 = st.columns([2,1])
                     b1.button("Apply Action", on_click=lambda: _enqueue_player_action("apply"))
                     b2.button("Clear Actions", on_click=lambda: _enqueue_player_action("clear"))
