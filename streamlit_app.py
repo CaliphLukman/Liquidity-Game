@@ -358,11 +358,16 @@ else:
     st.session_state.player_name = st.sidebar.text_input("Your name", value=st.session_state.player_name or "")
     uploaded = None
     start_clicked = refresh_clicked = end_clicked = False
-    shared = _json_read(SHARED_STATE_PATH, {})
-    if not shared.get("initialized"):
-        st.sidebar.info("Waiting for Host to upload CSV and start…")
+    
+    # Check if snapshot.json exists (the key change)
+    if not os.path.exists(SNAPSHOT_PATH):
+        st.sidebar.info("Waiting for Host to start...")
     else:
-        st.sidebar.caption(f"Rounds: {shared.get('rounds')} • Groups: {shared.get('num_groups')} • RNG seed: {shared.get('rng_seed')}")
+        shared = _json_read(SHARED_STATE_PATH, {})
+        if not shared.get("initialized"):
+            st.sidebar.info("Host is setting up...")
+        else:
+            st.sidebar.caption(f"Rounds: {shared.get('rounds')} • Groups: {shared.get('num_groups')} • RNG seed: {shared.get('rng_seed')}")
 
 with st.sidebar.expander("Game Instructions", expanded=False):
     st.markdown(f"""
@@ -423,9 +428,8 @@ if role == "Host" and start_clicked:
             st.session_state.inited_rounds = set()
             st.session_state.player_group_index = 0
 
-            # Clear queue & claims, publish shared session & blank snapshot
+            # Clear queue & claims, publish shared session
             _json_write_atomic(ACTIONS_QUEUE_PATH, [])
-            _json_write_atomic(SNAPSHOT_PATH, {})
             _json_write_atomic(SHARED_STATE_PATH, {
                 "initialized": True,
                 "rng_seed": seed_val,
@@ -434,6 +438,13 @@ if role == "Host" and start_clicked:
                 "current_round": 0,
                 "csv_ready": True,
                 "claims": {},   # group_name -> player_name
+                "ts": _now_ts()
+            })
+
+            # IMPORTANT: Write the initial snapshot.json file immediately
+            # This signals to players that the game has started
+            _json_write_atomic(SNAPSHOT_PATH, {
+                "published": True,
                 "ts": _now_ts()
             })
 
@@ -453,10 +464,16 @@ st.title("Liquidity Tranche Simulation")
 # Player bootstrap
 # ------------------------
 if role == "Player" and not st.session_state.initialized:
-    shared = _json_read(SHARED_STATE_PATH, {})
-    if not shared.get("initialized"):
+    # Now we check for snapshot.json instead of just shared state
+    if not os.path.exists(SNAPSHOT_PATH):
         st.info("Waiting for Host to start the session.")
         st.stop()
+    
+    shared = _json_read(SHARED_STATE_PATH, {})
+    if not shared.get("initialized"):
+        st.info("Host is still setting up...")
+        st.stop()
+        
     if not os.path.exists(UPLOADED_CSV_PATH):
         st.info("Waiting for Host CSV…")
         st.stop()
@@ -521,6 +538,7 @@ def _host_publish_snapshot():
             "positions": positions
         })
     _json_write_atomic(SNAPSHOT_PATH, {
+        "published": True,
         "round": r,
         "tickers": tickers_ui,
         "groups": groups_out,
@@ -753,7 +771,7 @@ if role == "Host":
 if role == "Player":
     shared = _json_read(SHARED_STATE_PATH, {})
     snapshot = _json_read(SNAPSHOT_PATH, {})
-    if not snapshot:
+    if not snapshot or not snapshot.get("published"):
         st.info("Waiting for Host to publish the round snapshot…")
         st.stop()
 
@@ -802,7 +820,7 @@ if role == "Player":
 repo_rate_today, td_rate_today = daily_rates_for_round(r)
 
 st.subheader(f"Round {r+1} — Date: {date_str}")
-st.caption(f"Today’s rates → Repo: {repo_rate_today*100:.2f}%  •  TD: {td_rate_today*100:.2f}%  •  Early TD penalty: 1.00%")
+st.caption(f"Today's rates → Repo: {repo_rate_today*100:.2f}%  •  TD: {td_rate_today*100:.2f}%  •  Early TD penalty: 1.00%")
 
 if role == "Host":
     cols = st.columns(NG)
@@ -908,7 +926,7 @@ else:
                     st.number_input("Use cash", min_value=0.0, step=0.01, value=st.session_state.get(cash_key, 0.0), format="%.2f", key=cash_key)
                     st.selectbox("Repo ticker", ["(none)"] + tickers_ui, index=(["(none)"] + tickers_ui).index(st.session_state.get(repo_tick_key, "(none)")), key=repo_tick_key)
                     st.number_input("Repo amount", min_value=0.0, step=0.01, value=st.session_state.get(repo_amt_key, 0.0), format="%.2f", key=repo_amt_key)
-                    st.caption(f"Today’s Repo rate: {daily_rates_for_round(r)[0]*100:.2f}%")
+                    st.caption(f"Today's Repo rate: {daily_rates_for_round(r)[0]*100:.2f}%")
 
                     st.number_input("Redeem Term Deposit", min_value=0.0, step=0.01, value=st.session_state.get(redeem_key, 0.0), format="%.2f", key=redeem_key)
                     st.caption("Early redemption penalty: 1.00%")
@@ -917,7 +935,7 @@ else:
                     st.number_input("Sell qty", min_value=0.0, step=0.01, value=st.session_state.get(sell_qty_key, 0.0), format="%.2f", key=sell_qty_key)
 
                     st.number_input("Invest in Term Deposit", min_value=0.0, step=0.01, value=st.session_state.get(invest_key, 0.0), format="%.2f", key=invest_key)
-                    st.caption(f"Today’s TD rate (if held to maturity): {daily_rates_for_round(r)[1]*100:.2f}%")
+                    st.caption(f"Today's TD rate (if held to maturity): {daily_rates_for_round(r)[1]*100:.2f}%")
 
                     st.selectbox("Buy ticker", ["(none)"] + tickers_ui, index=(["(none)"] + tickers_ui).index(st.session_state.get(buy_tick_key, "(none)")), key=buy_tick_key)
                     st.number_input("Buy qty", min_value=0.0, step=0.01, value=st.session_state.get(buy_qty_key, 0.0), format="%.2f", key=buy_qty_key)
