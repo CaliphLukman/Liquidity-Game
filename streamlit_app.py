@@ -170,7 +170,7 @@ SHARED_STATE_PATH   = ".shared_state.json"   # host pushes session info + claims
 UPLOADED_CSV_PATH   = ".uploaded.csv"        # host saves CSV here
 PLAYER_PORTFOLIOS_PATH = ".player_portfolios.json"  # real-time player portfolio states
 SNAPSHOT_PATH       = ".snapshot.json"       # published round info for all
-
+ACTIONS_QUEUE_PATH = ".actions_queue.json"  # player actions queue for host processing
 # ------------------------
 # Small helpers
 # ------------------------
@@ -1644,3 +1644,4 @@ elif st.session_state.role == "Player":
     shared = _json_read(SHARED_STATE_PATH, {})
     if int(shared.get("current_round", 0)) >= int(shared.get("rounds", st.session_state.rounds)):
         st.header("Game finished — waiting for host to display final results.")
+
