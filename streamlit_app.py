@@ -298,18 +298,25 @@ def _apply_staged_deltas_to_summary(base_summary: dict, base_positions: dict, st
     new_summary = dict(base_summary)
     new_positions = dict(base_positions)
     
-    # Initialize withdrawal tracking
+    # Initialize withdrawal tracking - CRITICAL: start fresh each time
     new_summary["_withdrawal_used"] = 0.0
+    
+    # If no staged inputs, return unchanged
+    if not staged_inputs:
+        return new_summary, new_positions
     
     # If staged_inputs is a list of actions (cumulative), process each one
     if isinstance(staged_inputs, list):
         for action_inputs in staged_inputs:
-            action_inputs["_total_withdrawal"] = total_withdrawal
-            new_summary, new_positions = _apply_single_staged_action(new_summary, new_positions, action_inputs, prices, r)
+            # Make a copy to avoid modifying original
+            action_copy = dict(action_inputs)
+            action_copy["_total_withdrawal"] = total_withdrawal
+            new_summary, new_positions = _apply_single_staged_action(new_summary, new_positions, action_copy, prices, r)
     else:
         # Single action
-        staged_inputs["_total_withdrawal"] = total_withdrawal
-        new_summary, new_positions = _apply_single_staged_action(new_summary, new_positions, staged_inputs, prices, r)
+        staged_copy = dict(staged_inputs)
+        staged_copy["_total_withdrawal"] = total_withdrawal
+        new_summary, new_positions = _apply_single_staged_action(new_summary, new_positions, staged_copy, prices, r)
     
     return new_summary, new_positions
 
