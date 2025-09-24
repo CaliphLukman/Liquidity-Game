@@ -297,42 +297,36 @@ def _apply_staged_deltas_to_summary(base_summary: dict, base_positions: dict, st
     # Copy base state
     new_summary = dict(base_summary)
     new_positions = dict(base_positions)
-    new_summary["_withdrawal_used"] = 0.0  # reset tracking for this preview
-
+    
+    # Initialize withdrawal tracking - CRITICAL: start fresh each time
+    new_summary["_withdrawal_used"] = 0.0
+    
+    # If no staged inputs, return unchanged
     if not staged_inputs:
         return new_summary, new_positions
-
-    # Normalize to a list of actions
-    inputs_list = staged_inputs if isinstance(staged_inputs, list) else [staged_inputs]
-
-    remaining_for_actions = max(0.0, float(host_remaining))
-    for action_inputs in inputs_list:
-        if not action_inputs:
-            continue
-        # Pass per-action remaining so the split (used vs excess) is correct
-        action_copy = dict(action_inputs)
-        action_copy["_total_withdrawal"] = float(total_withdrawal)
-        action_copy["_host_remaining"] = float(remaining_for_actions)
-
-        before_used = float(new_summary.get("_withdrawal_used", 0.0))
-        new_summary, new_positions = _apply_single_staged_action(new_summary, new_positions, action_copy, prices, r)
-        after_used = float(new_summary.get("_withdrawal_used", 0.0))
-        used_delta = max(0.0, after_used - before_used)
-        remaining_for_actions = max(0.0, remaining_for_actions - used_delta)
-
+    
+    # If staged_inputs is a list of actions (cumulative), process each one
+    if isinstance(staged_inputs, list):
+        remaining_for_actions = host_remaining
+        for action_inputs in staged_inputs:
+            # Make a copy to avoid modifying original
+            action_copy = dict(action_inputs)
+            action_copy["_total_withdrawal"] = total_withdrawal
+            action_copy["_host_remaining"] = remaining_for_actions
+            new_summary, new_positions = _apply_single_staged_action(new_summary, new_positions, action_copy, prices, r)
+            # Update remaining for next action
+            remaining_for_actions = max(0.0, remaining_for_actions - (new_summary.get("_withdrawal_used", 0.0) - action_copy.get("_prev_used", 0.0)))
+    else:
+        # Single action
+        staged_copy = dict(staged_inputs)
+        staged_copy["_total_withdrawal"] = total_withdrawal
+        staged_copy["_host_remaining"] = host_remaining
+        new_summary, new_positions = _apply_single_staged_action(new_summary, new_positions, staged_copy, prices, r)
+    
     return new_summary, new_positions
 
 def _apply_single_staged_action(summary: dict, positions: dict, inputs: dict, prices: dict, r: int) -> Tuple[dict, dict]:
-    """
-    Apply a single staged action to the current *preview* state.
-
-    Key fix: for repo / redeem / sell, split gross/net cash into:
-      - 'used'  -> applied to withdrawal need (reduces remaining),
-      - 'excess'-> credited to Current Account (so players see CA rise when need is 0).
-    """
-    # Remaining withdrawal *for this action* (host view handed down by wrapper)
-    rem = max(0.0, float(inputs.get("_host_remaining", 0.0)))
-
+    """Apply a single staged action to the current state."""
     # Extract inputs
     cash_use = max(0.0, float(inputs.get("cash", 0.0)))
     repo_amt = max(0.0, float(inputs.get("repo_amt", 0.0)))
@@ -343,104 +337,101 @@ def _apply_single_staged_action(summary: dict, positions: dict, inputs: dict, pr
     sell_tick = inputs.get("sell_tick", "(none)")
     buy_qty = max(0.0, float(inputs.get("buy_qty", 0.0)))
     buy_tick = inputs.get("buy_tick", "(none)")
-
-    # Work on copies
+    
+    # Apply changes to current account
     new_ca = float(summary["current_account"])
+    
+    # Track total used towards withdrawal requirement
     total_used_for_withdrawal = 0.0
-
-    # 1) Cash: CA -> withdrawal
+    
+    # 1. Cash use - reduces CA and counts towards withdrawal
     if cash_use > 0:
-        actual_cash_use = min(cash_use, max(0.0, new_ca), rem if rem > 0 else cash_use)
+        actual_cash_use = min(cash_use, max(0.0, new_ca))
         new_ca -= actual_cash_use
         total_used_for_withdrawal += actual_cash_use
-        rem = max(0.0, rem - actual_cash_use)
-
-    # 2) Repo: generate cash, reduce positions, split into used vs excess -> CA
+    
+    # 2. Repo - get cash from repo, reduce securities, cash used for withdrawal
     if repo_tick != "(none)" and repo_amt > 0 and repo_tick in prices:
-        px = float(prices[repo_tick])
-        max_collateral_cash = max(0.0, float(positions.get(repo_tick, 0.0))) * px
-        actual_repo = min(repo_amt, max_collateral_cash)
+        price = float(prices[repo_tick])
+        available_collateral = float(positions.get(repo_tick, 0.0)) * price
+        actual_repo = min(repo_amt, available_collateral)
         if actual_repo > 0:
-            units_repo = actual_repo / px
-            positions[repo_tick] = max(0.0, float(positions.get(repo_tick, 0.0)) - units_repo)
-            # reflect repo liability in preview
+            securities_to_repo = actual_repo / price
+            positions[repo_tick] = max(0.0, float(positions.get(repo_tick, 0.0)) - securities_to_repo)
             summary["repo_outstanding"] = float(summary["repo_outstanding"]) + actual_repo
-
-            used = min(actual_repo, rem) if rem > 0 else 0.0
-            excess = actual_repo - used
-            total_used_for_withdrawal += used
-            rem = max(0.0, rem - used)
-            new_ca += excess  # credit excess to CA
-
-    # 3) Redeem TD: net proceeds = principal - penalty; split
+            # Repo proceeds are used directly for withdrawal, not added to current account
+            total_used_for_withdrawal += actual_repo
+    
+    # 3. Redeem TD - get cash, reduce TD investment, net proceeds used for withdrawal
     if redeem_amt > 0:
-        td_avail = max(0.0, float(summary["td_invested"]))
-        take = min(redeem_amt, td_avail)
-        if take > 0:
-            penalty = take * TD_PENALTY
-            net = max(0.0, take - penalty)
-            summary["td_invested"] = td_avail - take
+        available_td = float(summary["td_invested"])
+        actual_redeem = min(redeem_amt, available_td)
+        if actual_redeem > 0:
+            penalty = actual_redeem * TD_PENALTY
+            net_proceeds = actual_redeem - penalty
+            summary["td_invested"] = available_td - actual_redeem
             summary["pnl_realized"] = float(summary["pnl_realized"]) - penalty
-
-            used = min(net, rem) if rem > 0 else 0.0
-            excess = net - used
-            total_used_for_withdrawal += used
-            rem = max(0.0, rem - used)
-            new_ca += excess  # credit excess to CA
-
-    # 4) Sell: proceeds based on bid (sell) price; split
+            # Net proceeds (after penalty) used for withdrawal, not added to current account
+            total_used_for_withdrawal += net_proceeds
+    
+    # 4. Sell - get cash, reduce securities, proceeds used for withdrawal
     if sell_tick != "(none)" and sell_qty > 0 and sell_tick in prices:
-        bid_px = calculate_effective_price_with_spread(float(prices[sell_tick]), False)
-        have = max(0.0, float(positions.get(sell_tick, 0.0)))
-        qty = min(sell_qty, have)
-        if qty > 0:
-            proceeds = qty * bid_px
-            positions[sell_tick] = have - qty
-
-            used = min(proceeds, rem) if rem > 0 else 0.0
-            excess = proceeds - used
-            total_used_for_withdrawal += used
-            rem = max(0.0, rem - used)
-            new_ca += excess  # credit excess to CA
-
-    # 5) Invest TD: consume CA
+        price = calculate_effective_price_with_spread(float(prices[sell_tick]), False)
+        available_qty = float(positions.get(sell_tick, 0.0))
+        actual_sell = min(sell_qty, available_qty)
+        if actual_sell > 0:
+            proceeds = actual_sell * price
+            positions[sell_tick] = available_qty - actual_sell
+            # Sell proceeds are used directly for withdrawal, not added to current account
+            total_used_for_withdrawal += proceeds
+    
+    # 5. Invest TD - use cash, increase TD investment
     if invest_amt > 0:
-        invest = min(invest_amt, max(0.0, new_ca))
-        if invest > 0:
-            new_ca -= invest
-            summary["td_invested"] = float(summary["td_invested"]) + invest
-
-    # 6) Buy: consume CA
+        actual_invest = min(invest_amt, max(0.0, new_ca))
+        if actual_invest > 0:
+            new_ca -= actual_invest
+            summary["td_invested"] = float(summary["td_invested"]) + actual_invest
+    
+    # 6. Buy - use cash, increase securities
     if buy_tick != "(none)" and buy_qty > 0 and buy_tick in prices:
-        ask_px = calculate_effective_price_with_spread(float(prices[buy_tick]), True)
-        cost = buy_qty * ask_px
+        price = calculate_effective_price_with_spread(float(prices[buy_tick]), True)
+        cost = buy_qty * price
         if cost <= new_ca:
             new_ca -= cost
             positions[buy_tick] = float(positions.get(buy_tick, 0.0)) + buy_qty
-
-    # Recompute aggregates
+    
+    # Update current account and recalculate securities MV
     summary["current_account"] = new_ca
-    sec_mv = sum(float(positions.get(t, 0.0)) * float(prices.get(t, 0.0)) for t in prices.keys())
-    summary["securities_mv"] = sec_mv
-    summary["total_mv"] = new_ca + sec_mv + float(summary["td_invested"]) - float(summary["repo_outstanding"])
+    securities_mv = sum(float(positions.get(t, 0.0)) * float(prices.get(t, 0.0)) for t in prices.keys())
+    summary["securities_mv"] = securities_mv
+    summary["total_mv"] = new_ca + securities_mv + float(summary["td_invested"]) - float(summary["repo_outstanding"])
+    
+    # Store the amount used for withdrawal tracking
     summary["_withdrawal_used"] = summary.get("_withdrawal_used", 0.0) + total_used_for_withdrawal
+    
     return summary, positions
 
-# Helper for staged consumption estimate (preview)
+# Helper function for staged consumption estimate (moved here before usage)
 def _estimate_used_from_inputs(group_payload: dict, staged_inputs, prices: Dict[str, float]) -> float:
     """Approximate 'use' toward withdrawal from the current staged inputs."""
     if not staged_inputs:
         return 0.0
+    
     s = group_payload["summary"]
     pos = group_payload["positions"]
     used = 0.0
+    
+    # Handle both single input dict and list of cumulative inputs
     inputs_list = staged_inputs if isinstance(staged_inputs, list) else [staged_inputs]
+    
     for inputs in inputs_list:
         if not inputs:
             continue
+            
         # 1) cash
         cash = max(0.0, float(inputs.get("cash", 0.0)))
         used += min(cash, max(0.0, float(s["current_account"])))
+        
         # 2) repo
         repo_amt = max(0.0, float(inputs.get("repo_amt", 0.0)))
         repo_tick = inputs.get("repo_tick", "(none)")
@@ -448,12 +439,14 @@ def _estimate_used_from_inputs(group_payload: dict, staged_inputs, prices: Dict[
             px = float(prices[repo_tick])
             collateral_cap = max(0.0, float(pos.get(repo_tick, 0.0))) * px
             used += min(repo_amt, collateral_cap)
+        
         # 3) redeem TD
         redeem = max(0.0, float(inputs.get("redeem", 0.0)))
         td_invested = max(0.0, float(s["td_invested"]))
         redeem_actual = min(redeem, td_invested)
         penalty = redeem_actual * TD_PENALTY
         used += max(0.0, redeem_actual - penalty)
+        
         # 4) sell
         sell_qty = max(0.0, float(inputs.get("sell_qty", 0.0)))
         sell_tick = inputs.get("sell_tick", "(none)")
@@ -461,6 +454,7 @@ def _estimate_used_from_inputs(group_payload: dict, staged_inputs, prices: Dict[
             pxs = calculate_effective_price_with_spread(float(prices[sell_tick]), False)
             max_qty = max(0.0, float(pos.get(sell_tick, 0.0)))
             used += min(sell_qty, max_qty) * pxs
+    
     return used
 
 # ---- safe adapters
@@ -634,7 +628,8 @@ if role == "Host" and start_clicked:
                 "ts": _now_ts()
             })
 
-            # IMPORTANT: initial snapshot
+            # IMPORTANT: Write the initial snapshot.json file immediately
+            # This signals to players that the game has started
             _json_write_atomic(SNAPSHOT_PATH, {
                 "published": True,
                 "ts": _now_ts()
@@ -656,13 +651,16 @@ st.title("Liquidity Tranche Simulation")
 # Player bootstrap
 # ------------------------
 if role == "Player" and not st.session_state.initialized:
+    # Now we check for snapshot.json instead of just shared state
     if not os.path.exists(SNAPSHOT_PATH):
         st.info("Waiting for Host to start the session.")
         st.stop()
+    
     shared = _json_read(SHARED_STATE_PATH, {})
     if not shared.get("initialized"):
         st.info("Host is still setting up...")
         st.stop()
+        
     if not os.path.exists(UPLOADED_CSV_PATH):
         st.info("Waiting for Host CSV…")
         st.stop()
@@ -695,6 +693,7 @@ if role == "Player":
         host_round = int(shared.get("current_round", st.session_state.current_round))
         if host_round != st.session_state.current_round:
             st.session_state.current_round = host_round
+            # Clear staged inputs when round changes but preserve player selection
             st.session_state.staged_inputs = {}
 
 df = st.session_state.price_df
@@ -703,7 +702,7 @@ tickers_ui = all_tickers[:3]  # the 3 shown in UI
 r = st.session_state.current_round
 NG = max(1, int(st.session_state.get("num_groups", 1)))
 
-# Compute prices
+# Compute prices (ALL for valuation, subset for UI lines)
 date_str, prices_all = base_prices_for_round(r, df, all_tickers)
 prices_ui = {t: prices_all[t] for t in tickers_ui}
 
@@ -711,14 +710,15 @@ prices_ui = {t: prices_all[t] for t in tickers_ui}
 # Host: settle maturities, ensure withdrawal, consume queue, publish snapshot
 # ------------------------
 def _host_publish_snapshot():
+    """Publish full round snapshot with per-group remaining to make Player UI richer & consistent."""
     groups_out = []
     req = float(st.session_state.withdrawals[r]) if r < len(st.session_state.withdrawals) else 0.0
     for p in st.session_state.portfolios:
-        s = p.summary(prices_all)
+        s = p.summary(prices_all)  # ALL tickers (for accurate totals)
         positions_ui = {t: float(p.pos_qty.get(t, 0.0)) for t in tickers_ui}
         remaining = compute_remaining_for_group(p.name, r, req)
         groups_out.append({
-            "name": p.name,
+            "name": p.name,                  # stable id by name to map actions
             "summary": {
                 "current_account": s["current_account"],
                 "securities_mv": s["securities_mv"],
@@ -728,7 +728,7 @@ def _host_publish_snapshot():
                 "total_mv": s["total_mv"],
             },
             "positions": positions_ui,
-            "remaining": remaining,
+            "remaining": remaining,          # NEW: remaining for this round (host truth)
         })
     _json_write_atomic(SNAPSHOT_PATH, {
         "published": True,
@@ -812,7 +812,7 @@ def _host_apply_single_action(p: Portfolio, req_all: float, px_ui: Dict[str, flo
     sell_qty   = clamp_float(action.get("sell_qty"))
     sell_tick  = action.get("sell_tick") or "(none)"
     buy_qty    = clamp_float(action.get("buy_qty"))
-    buy_tick   = clamp_float(action.get("buy_tick")) if False else action.get("buy_tick") or "(none)"
+    buy_tick   = action.get("buy_tick") or "(none)"
 
     # 1) cash
     if cash_amt > 0 and rem_left > 0:
@@ -822,7 +822,7 @@ def _host_apply_single_action(p: Portfolio, req_all: float, px_ui: Dict[str, flo
             rem_left -= use
             history.append(("cash", {"used": round(use, 2)}))
     
-    # 2) repo — deduct 'use' from CA (gross already credited by game_core)
+    # 2) repo - FIXED: handle excess properly
     if repo_tick != "(none)" and repo_amt > 0:
         price = float(px_ui.get(repo_tick, 0.0))
         max_amt = p.pos_qty.get(repo_tick, 0.0) * price
@@ -830,49 +830,65 @@ def _host_apply_single_action(p: Portfolio, req_all: float, px_ui: Dict[str, flo
         if repo_amt > 0:
             repo_rate = daily_rates_for_round(r)[0]
             info = _safe_repo_call(p, repo_tick, repo_amt, price, r, repo_rate)
-            got = float(info["got"])  # gross proceeds; CA already increased by game_core
+            got = float(info["got"])
+            
+            # CRITICAL FIX: Split proceeds correctly
             if rem_left > 0:
                 use = min(got, rem_left)
-                p.current_account -= use
+                excess = got - use
                 rem_left -= use
             else:
                 use = 0.0
+                excess = got  # All goes to current account when no withdrawal needed
+            
+            p.current_account += excess  # Add excess to current account
+            
             history.append(("repo", {
                 "ticker": repo_tick, "got": round(got, 2), "use": round(use, 2),
                 "repo_id": info["repo_id"], "rate": repo_rate
             }))
     
-    # 3) redeem td — deduct 'use' from CA (net already credited by game_core)
+    # 3) redeem td - FIXED: handle excess properly
     if redeem_amt > 0:
         red = _safe_redeem_td(p, redeem_amt, r)
         principal = float(red["principal"])
-        penalty   = float(red["penalty"])
-        net = principal - penalty
+        
+        # CRITICAL FIX: Split proceeds correctly
         if rem_left > 0:
-            use = min(net, rem_left)
-            p.current_account -= use
+            use = min(principal, rem_left)
+            excess = principal - use
             rem_left -= use
         else:
             use = 0.0
+            excess = principal  # All goes to current account when no withdrawal needed
+        
+        p.current_account += excess  # Add excess to current account
+        
         history.append(("redeem_td", {
             "principal": round(principal, 2),
-            "penalty":   round(penalty, 2),
+            "penalty":   round(float(red["penalty"]), 2),
             "use":       round(use, 2),
             "chunks":    red.get("redeemed", []),
         }))
     
-    # 4) sell — deduct 'use' from CA (gross already credited by game_core)
+    # 4) sell - FIXED: handle excess properly
     if sell_tick != "(none)" and sell_qty > 0:
         sell_qty = min(sell_qty, p.pos_qty.get(sell_tick, 0.0))
         if sell_qty > 0:
             sale = _safe_sale(p, sell_tick, sell_qty, px_ui[sell_tick])
-            proceeds = sale["proceeds"]  # CA already increased by proceeds in game_core
+            proceeds = sale["proceeds"]
+            
+            # CRITICAL FIX: Split proceeds correctly
             if rem_left > 0:
                 use = min(proceeds, rem_left)
-                p.current_account -= use
+                excess = proceeds - use
                 rem_left -= use
             else:
                 use = 0.0
+                excess = proceeds  # All goes to current account when no withdrawal needed
+            
+            p.current_account += excess  # Add excess to current account
+            
             history.append(("sell", {
                 "ticker": sale["ticker"],
                 "qty": round(sale["qty"], 2),
@@ -924,7 +940,7 @@ def _host_consume_actions_and_publish(req_all: float):
             rr = int(a.get("round", -1))
             a_type = a.get("type", "apply")
             gname = a.get("group_name", "")
-            gi = _find_portfolio_index_by_name(gname)
+            gi = _find_portfolio_index_by_name(gname)  # <-- map by NAME (fixes 'always group 4' bug)
             if rr != r or gi is None:
                 continue
             p = st.session_state.portfolios[gi]
@@ -953,9 +969,12 @@ def _render_endgame(final_px_all: Dict[str, float]):
             "total_reserve": s["total_mv"],
         })
     sb = pd.DataFrame(rows)
+    
+    # Format all monetary columns with dollar signs
     for col in ["current_account", "securities_reserve", "repo_outstanding", "term_deposit", "pnl_realized", "total_reserve"]:
         if col in sb.columns:
             sb[col] = sb[col].apply(lambda x: _fmt_money(x))
+    
     st.dataframe(sb, use_container_width=True)
     st.download_button("Download scoreboard CSV", sb.to_csv(index=False).encode("utf-8"),
                        file_name="scoreboard.csv", mime="text/csv")
@@ -964,7 +983,8 @@ def _render_endgame(final_px_all: Dict[str, float]):
     st.stop()
 
 # ------------------------
-# Host flow
+# Host flow: settle maturities, ensure withdrawal
+# (consume queue + publish snapshot ONLY on Refresh or Next Round)
 # ------------------------
 if role == "Host":
     if st.session_state.last_maturity_round != r:
@@ -974,12 +994,13 @@ if role == "Host":
     ensure_round_initialized(r, prices_all)
     req_all = float(st.session_state.withdrawals[r])
 
+    # Manual refresh (host clicks)
     if 'refresh_clicked' in locals() and refresh_clicked:
         _host_consume_actions_and_publish(req_all)
         _safe_rerun()
 
 # ------------------------
-# Player flow
+# Player flow: claim + Apply/Clear (send to queue), render from snapshot
 # ------------------------
 if role == "Player":
     shared = _json_read(SHARED_STATE_PATH, {})
@@ -998,6 +1019,7 @@ if role == "Player":
         st.stop()
 
     claims: Dict[str, str] = shared.get("claims", {})
+    # claims status
     claim_cols = st.columns(len(group_names))
     for i, c in enumerate(claim_cols):
         gname = group_names[i]
@@ -1005,13 +1027,17 @@ if role == "Player":
             owner = claims.get(gname, "")
             st.caption(f"{gname}: {'(unclaimed)' if not owner else 'claimed by: ' + owner}")
 
+    # choose + claim with persistent selection
     if group_names:
+        # Ensure player_group_index is within valid range
         valid_index = min(max(st.session_state.player_group_index, 0), len(group_names)-1)
         if st.session_state.player_group_index != valid_index:
             st.session_state.player_group_index = valid_index
+        
         chosen = st.sidebar.selectbox("Select your Group", group_names, 
                                     index=st.session_state.player_group_index,
                                     key="player_group_selector")
+        # Update the stored index when selection changes
         new_index = group_names.index(chosen)
         if new_index != st.session_state.player_group_index:
             st.session_state.player_group_index = new_index
@@ -1065,22 +1091,23 @@ else:
             G = groups[g]
             s = G["summary"]
             positions = G["positions"]
-            host_remaining = float(G.get("remaining", 0.0))
-
+            
+            # Apply instant local adjustments if this is the player's claimed group
+            chosen_name = groups[st.session_state.player_group_index]["name"] if st.session_state.player_group_index < len(groups) else ""
             you_own_this = claims.get(G["name"], "") == st.session_state.player_name.strip()
             staged_key = f"r{r}_group_{G['name']}"
             staged_inputs = st.session_state.staged_inputs.get(staged_key, {})
-
+            
             if you_own_this and staged_inputs:
-                # >>> pass host_remaining so preview splits proceeds correctly
-                s, positions = _apply_staged_deltas_to_summary(s, positions, staged_inputs, prices_ui, r, req_all, host_remaining)
-
+                s, positions = _apply_staged_deltas_to_summary(s, positions, staged_inputs, prices_ui, r, req_all)
+            
             st.markdown(f"### {G['name']}")
             st.markdown(f"<div style='font-size:28px; font-weight:800; color:#006400;'>{_fmt_money(s['total_mv'],0)}</div>", unsafe_allow_html=True)
             for t in tickers_ui:
                 qty = float(positions.get(t, 0.0))
                 st.markdown(f"<div class='ticker-line'>{t}: {qty:,.0f} @ {_fmt_money(prices_ui[t])}</div>", unsafe_allow_html=True)
             
+            # Progress bar - use base remaining minus any staged consumption
             group_rem = float(G.get("remaining", 0.0))
             if you_own_this and staged_inputs:
                 staged_used = _estimate_used_from_inputs(G, staged_inputs, prices_ui)
@@ -1132,21 +1159,34 @@ else:
                 base_pos = G["positions"]
                 rem_host = float(G.get("remaining", 0.0))
 
+                # Apply instant adjustments if this is the player's group
                 you_own_this_group = claims.get(G["name"], "") == st.session_state.player_name.strip()
                 staged_key = f"r{r}_group_{G['name']}"
                 staged_inputs = st.session_state.staged_inputs.get(staged_key, [])
                 
+                # Calculate adjusted state with detailed debugging
                 if you_own_this_group and staged_inputs:
                     total_withdrawal = float(snapshot.get('withdrawal', 0.0))
                     original_ca = float(base_s['current_account'])
-                    # >>> pass rem_host so preview splits proceeds correctly
-                    s, pos = _apply_staged_deltas_to_summary(base_s, base_pos, staged_inputs, prices_ui, r, total_withdrawal, rem_host)
+                    
+                    s, pos = _apply_staged_deltas_to_summary(base_s, base_pos, staged_inputs, prices_ui, r, total_withdrawal)
+                    
+                    # Debug: Show what changed with detailed breakdown
                     new_ca = float(s['current_account'])
                     ca_change = new_ca - original_ca
+                    
+                    # Calculate remaining based on how much we've used for withdrawals
                     withdrawal_used = s.get("_withdrawal_used", 0.0)
                     rem_effective = max(0.0, rem_host - withdrawal_used)
+                    
+                    # Debug display for troubleshooting
                     if ca_change != 0 or withdrawal_used > 0:
                         st.caption(f"DEBUG: CA change: {_fmt_money(ca_change)}, Withdrawal used: {_fmt_money(withdrawal_used)}")
+                        # Show sell debug info if available
+                        if "_debug_sell" in s:
+                            sell_debug = s["_debug_sell"]
+                            st.caption(f"SELL DEBUG: Proceeds: {_fmt_money(sell_debug['gross_proceeds'])}, To withdrawal: {_fmt_money(sell_debug['withdrawal_amount'])}, To CA: {_fmt_money(sell_debug['ca_amount'])}")
+
                 else:
                     s, pos = base_s, base_pos
                     rem_effective = rem_host
@@ -1163,15 +1203,19 @@ else:
                     st.metric("PnL Realized",           _fmt_money(s['pnl_realized']))
                     st.metric("Total Reserve",          _fmt_money(s['total_mv']))
 
+                # Show withdrawal progress
                 st.markdown(f"**Withdrawal (all groups):** :blue[{_fmt_money(snapshot.get('withdrawal', 0.0))}]")
                 st.markdown(f"**Remaining:** :orange[{_fmt_money(rem_effective)}]")
 
+                # Show updated positions with bid/ask spreads for trading decisions
                 st.markdown("**Current Holdings & Market Prices:**")
+                
                 for t in tickers_ui:
                     qty = float(pos.get(t, 0.0))
                     market_px = float(prices_ui[t])
-                    bid_px = calculate_effective_price_with_spread(market_px, False)
-                    ask_px = calculate_effective_price_with_spread(market_px, True)
+                    bid_px = calculate_effective_price_with_spread(market_px, False)  # What you get when selling
+                    ask_px = calculate_effective_price_with_spread(market_px, True)   # What you pay when buying
+                    
                     col1, col2, col3 = st.columns([2, 1, 1])
                     with col1:
                         st.metric(f"**{t}**", f"{qty:,.0f} units", f"Market: {_fmt_money(market_px)}")
@@ -1182,6 +1226,7 @@ else:
                         st.caption(f"**Ask:** {_fmt_money(ask_px)}")
                         st.caption("*(You pay)*")
 
+                # Inputs ONLY on your own claimed group; others read-only
                 if gi == chosen_idx and you_own:
                     tickers_ui = snapshot.get("tickers", tickers_ui)
 
@@ -1202,10 +1247,14 @@ else:
                     st.divider()
                     st.markdown("**Action Inputs:**")
 
+                    # Cash input
                     st.number_input("Use cash", min_value=0.0, step=0.01, value=st.session_state.get(cash_key, 0.0), format="%.2f", key=cash_key)
+                    
+                    # Repo inputs with preview
                     st.selectbox("Repo ticker", ["(none)"] + tickers_ui, index=(["(none)"] + tickers_ui).index(st.session_state.get(repo_tick_key, "(none)")), key=repo_tick_key)
                     st.number_input("Repo amount", min_value=0.0, step=0.01, value=st.session_state.get(repo_amt_key, 0.0), format="%.2f", key=repo_amt_key)
-
+                    
+                    # Repo preview
                     repo_tick = st.session_state.get(repo_tick_key, "(none)")
                     repo_amt = get_float(repo_amt_key)
                     if repo_tick != "(none)" and repo_amt > 0 and repo_tick in prices_ui:
@@ -1213,8 +1262,10 @@ else:
                         available_units = float(pos.get(repo_tick, 0.0))
                         max_units = min(repo_units, available_units)
                         st.caption(f"≈ {max_units:,.1f} units of {repo_tick} (max: {available_units:,.0f})")
+                    
                     st.caption(f"Today's Repo rate: {daily_rates_for_round(r)[0]*100:.2f}%")
 
+                    # TD Redemption
                     st.number_input("Redeem Term Deposit", min_value=0.0, step=0.01, value=st.session_state.get(redeem_key, 0.0), format="%.2f", key=redeem_key)
                     redeem_amt = get_float(redeem_key)
                     if redeem_amt > 0:
@@ -1224,8 +1275,12 @@ else:
                     else:
                         st.caption(f"Early redemption penalty: {TD_PENALTY*100:.2f}%")
 
+                    # Sell inputs with preview
+                    # Sell inputs with preview
                     st.selectbox("Sell ticker", ["(none)"] + tickers_ui, index=(["(none)"] + tickers_ui).index(st.session_state.get(sell_tick_key, "(none)")), key=sell_tick_key)
                     st.number_input("Sell qty", min_value=0.0, step=0.01, value=st.session_state.get(sell_qty_key, 0.0), format="%.2f", key=sell_qty_key)
+                    
+                    # Sell preview
                     sell_tick = st.session_state.get(sell_tick_key, "(none)")
                     sell_qty = get_float(sell_qty_key)
                     if sell_tick != "(none)" and sell_qty > 0 and sell_tick in prices_ui:
@@ -1236,11 +1291,15 @@ else:
                         proceeds = max_qty * effective_price
                         st.caption(f"{max_qty:,.1f} × {_fmt_money(effective_price)} = {_fmt_money(proceeds)} (max: {available_qty:,.0f})")
 
+                    # TD Investment
                     st.number_input("Invest in Term Deposit", min_value=0.0, step=0.01, value=st.session_state.get(invest_key, 0.0), format="%.2f", key=invest_key)
                     st.caption(f"Today's TD rate (if held to maturity): {daily_rates_for_round(r)[1]*100:.2f}% • Matures in {TD_MAT_GAP} rounds")
 
+                    # Buy inputs with preview
                     st.selectbox("Buy ticker", ["(none)"] + tickers_ui, index=(["(none)"] + tickers_ui).index(st.session_state.get(buy_tick_key, "(none)")), key=buy_tick_key)
                     st.number_input("Buy qty", min_value=0.0, step=0.01, value=st.session_state.get(buy_qty_key, 0.0), format="%.2f", key=buy_qty_key)
+                    
+                    # Buy preview
                     buy_tick = st.session_state.get(buy_tick_key, "(none)")
                     buy_qty = get_float(buy_qty_key)
                     if buy_tick != "(none)" and buy_qty > 0 and buy_tick in prices_ui:
@@ -1266,17 +1325,24 @@ else:
                             "buy_tick":  st.session_state.get(buy_tick_key, "(none)")
                         }
 
+                    # Action buttons - Fixed to avoid session state modification in callbacks
                     b1, b2 = st.columns([2,1])
+                    
                     with b1:
                         apply_clicked = st.button("Apply Action", type="primary", key=f"apply_{gi}_{r}")
                     with b2:
                         clear_clicked = st.button("Clear Actions", key=f"clear_{gi}_{r}")
 
+                    # Handle button clicks outside of callbacks
                     if apply_clicked:
                         inputs = _collect_current_inputs()
+                        
+                        # Get existing staged inputs and make them cumulative
                         current_staged = st.session_state.staged_inputs.get(staged_key, [])
                         if not isinstance(current_staged, list):
                             current_staged = [current_staged] if current_staged else []
+                        
+                        # Only add non-zero actions to the staged list
                         has_action = any([
                             inputs.get("cash", 0) > 0,
                             inputs.get("repo_amt", 0) > 0 and inputs.get("repo_tick") != "(none)",
@@ -1285,31 +1351,40 @@ else:
                             inputs.get("sell_qty", 0) > 0 and inputs.get("sell_tick") != "(none)",
                             inputs.get("buy_qty", 0) > 0 and inputs.get("buy_tick") != "(none)"
                         ])
+                        
                         if has_action:
                             current_staged.append(inputs)
                             st.session_state.staged_inputs[staged_key] = current_staged
+                            
+                            # Enqueue by NAME (not index) to avoid mismatches on Host
                             action = {
                                 "ts": _now_ts(),
                                 "type": "apply",
                                 "by": st.session_state.player_name.strip(),
-                                "group_name": G["name"],
+                                "group_name": G["name"],  # Use group name for correct binding
                                 "round": r,
                                 "inputs": inputs
                             }
                             _json_mutate(ACTIONS_QUEUE_PATH, [], lambda q: (q if isinstance(q, list) else []) + [action])
+                            
+                            # Clear input fields after successful apply
                             for k in [cash_key, repo_amt_key, redeem_key, invest_key, sell_qty_key, buy_qty_key]:
                                 if k in st.session_state:
                                     del st.session_state[k]
                             for k in [repo_tick_key, sell_tick_key, buy_tick_key]:
                                 if k in st.session_state:
                                     del st.session_state[k]
+                            
                             st.success("Action applied! Enter new values and click Apply again to add more actions.")
                         else:
                             st.warning("Please enter some action values before applying.")
+                        
                         _safe_rerun()
 
                     if clear_clicked:
+                        # Clear staged inputs
                         st.session_state.staged_inputs[staged_key] = []
+                        # Enqueue clear action
                         action = {
                             "ts": _now_ts(),
                             "type": "clear",
@@ -1319,19 +1394,23 @@ else:
                             "inputs": {}
                         }
                         _json_mutate(ACTIONS_QUEUE_PATH, [], lambda q: (q if isinstance(q, list) else []) + [action])
+                        
+                        # Clear input fields
                         for k in [cash_key, repo_amt_key, redeem_key, invest_key, sell_qty_key, buy_qty_key]:
                             if k in st.session_state:
                                 del st.session_state[k]
                         for k in [repo_tick_key, sell_tick_key, buy_tick_key]:
                             if k in st.session_state:
                                 del st.session_state[k]
+                        
                         st.success("Actions cleared!")
                         _safe_rerun()
+                        
                 else:
                     st.caption("Read-only (not your claimed group).")
 
 # ------------------------
-# Controls
+# Controls (Host advances rounds for everyone)
 # ------------------------
 st.divider()
 lft, rgt = st.columns([3,1])
@@ -1348,7 +1427,9 @@ if st.session_state.role == "Host":
             if not all_covered:
                 st.error("Cover all groups (remaining ≤ $0.01) before moving on.")
             else:
+                # Clear all staged inputs when advancing round
                 st.session_state.staged_inputs = {}
+                
                 if st.session_state.current_round + 1 < st.session_state.rounds:
                     st.session_state.current_round += 1
                 else:
