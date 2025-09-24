@@ -298,19 +298,31 @@ def _apply_staged_deltas_to_summary(base_summary: dict, base_positions: dict, st
     new_summary = dict(base_summary)
     new_positions = dict(base_positions)
     
+    # If staged_inputs is a list of actions (cumulative), process each one
+    if isinstance(staged_inputs, list):
+        for action_inputs in staged_inputs:
+            new_summary, new_positions = _apply_single_staged_action(new_summary, new_positions, action_inputs, prices, r)
+    else:
+        # Single action
+        new_summary, new_positions = _apply_single_staged_action(new_summary, new_positions, staged_inputs, prices, r)
+    
+    return new_summary, new_positions
+
+def _apply_single_staged_action(summary: dict, positions: dict, inputs: dict, prices: dict, r: int) -> Tuple[dict, dict]:
+    """Apply a single staged action to the current state."""
     # Extract inputs
-    cash_use = max(0.0, float(staged_inputs.get("cash", 0.0)))
-    repo_amt = max(0.0, float(staged_inputs.get("repo_amt", 0.0)))
-    repo_tick = staged_inputs.get("repo_tick", "(none)")
-    redeem_amt = max(0.0, float(staged_inputs.get("redeem", 0.0)))
-    invest_amt = max(0.0, float(staged_inputs.get("invest_td", 0.0)))
-    sell_qty = max(0.0, float(staged_inputs.get("sell_qty", 0.0)))
-    sell_tick = staged_inputs.get("sell_tick", "(none)")
-    buy_qty = max(0.0, float(staged_inputs.get("buy_qty", 0.0)))
-    buy_tick = staged_inputs.get("buy_tick", "(none)")
+    cash_use = max(0.0, float(inputs.get("cash", 0.0)))
+    repo_amt = max(0.0, float(inputs.get("repo_amt", 0.0)))
+    repo_tick = inputs.get("repo_tick", "(none)")
+    redeem_amt = max(0.0, float(inputs.get("redeem", 0.0)))
+    invest_amt = max(0.0, float(inputs.get("invest_td", 0.0)))
+    sell_qty = max(0.0, float(inputs.get("sell_qty", 0.0)))
+    sell_tick = inputs.get("sell_tick", "(none)")
+    buy_qty = max(0.0, float(inputs.get("buy_qty", 0.0)))
+    buy_tick = inputs.get("buy_tick", "(none)")
     
     # Apply changes to current account
-    new_ca = float(new_summary["current_account"])
+    new_ca = float(summary["current_account"])
     
     # 1. Cash use - reduces CA
     new_ca -= min(cash_use, max(0.0, new_ca))
@@ -318,41 +330,41 @@ def _apply_staged_deltas_to_summary(base_summary: dict, base_positions: dict, st
     # 2. Repo - get cash from repo, reduce securities
     if repo_tick != "(none)" and repo_amt > 0 and repo_tick in prices:
         price = float(prices[repo_tick])
-        available_collateral = float(new_positions.get(repo_tick, 0.0)) * price
+        available_collateral = float(positions.get(repo_tick, 0.0)) * price
         actual_repo = min(repo_amt, available_collateral)
         if actual_repo > 0:
             new_ca += actual_repo  # Get cash from repo
             securities_to_repo = actual_repo / price
-            new_positions[repo_tick] = max(0.0, float(new_positions.get(repo_tick, 0.0)) - securities_to_repo)
-            new_summary["repo_outstanding"] = float(new_summary["repo_outstanding"]) + actual_repo
+            positions[repo_tick] = max(0.0, float(positions.get(repo_tick, 0.0)) - securities_to_repo)
+            summary["repo_outstanding"] = float(summary["repo_outstanding"]) + actual_repo
     
     # 3. Redeem TD - get cash, reduce TD investment
     if redeem_amt > 0:
-        available_td = float(new_summary["td_invested"])
+        available_td = float(summary["td_invested"])
         actual_redeem = min(redeem_amt, available_td)
         if actual_redeem > 0:
             penalty = actual_redeem * TD_PENALTY
             net_proceeds = actual_redeem - penalty
             new_ca += net_proceeds
-            new_summary["td_invested"] = available_td - actual_redeem
-            new_summary["pnl_realized"] = float(new_summary["pnl_realized"]) - penalty
+            summary["td_invested"] = available_td - actual_redeem
+            summary["pnl_realized"] = float(summary["pnl_realized"]) - penalty
     
     # 4. Sell - get cash, reduce securities
     if sell_tick != "(none)" and sell_qty > 0 and sell_tick in prices:
         price = calculate_effective_price_with_spread(float(prices[sell_tick]), False)
-        available_qty = float(new_positions.get(sell_tick, 0.0))
+        available_qty = float(positions.get(sell_tick, 0.0))
         actual_sell = min(sell_qty, available_qty)
         if actual_sell > 0:
             proceeds = actual_sell * price
             new_ca += proceeds
-            new_positions[sell_tick] = available_qty - actual_sell
+            positions[sell_tick] = available_qty - actual_sell
     
     # 5. Invest TD - use cash, increase TD investment
     if invest_amt > 0:
         actual_invest = min(invest_amt, max(0.0, new_ca))
         if actual_invest > 0:
             new_ca -= actual_invest
-            new_summary["td_invested"] = float(new_summary["td_invested"]) + actual_invest
+            summary["td_invested"] = float(summary["td_invested"]) + actual_invest
     
     # 6. Buy - use cash, increase securities
     if buy_tick != "(none)" and buy_qty > 0 and buy_tick in prices:
@@ -360,49 +372,59 @@ def _apply_staged_deltas_to_summary(base_summary: dict, base_positions: dict, st
         cost = buy_qty * price
         if cost <= new_ca:
             new_ca -= cost
-            new_positions[buy_tick] = float(new_positions.get(buy_tick, 0.0)) + buy_qty
+            positions[buy_tick] = float(positions.get(buy_tick, 0.0)) + buy_qty
     
     # Update current account and recalculate securities MV
-    new_summary["current_account"] = new_ca
-    securities_mv = sum(float(new_positions.get(t, 0.0)) * float(prices.get(t, 0.0)) for t in prices.keys())
-    new_summary["securities_mv"] = securities_mv
-    new_summary["total_mv"] = new_ca + securities_mv + float(new_summary["td_invested"]) - float(new_summary["repo_outstanding"])
+    summary["current_account"] = new_ca
+    securities_mv = sum(float(positions.get(t, 0.0)) * float(prices.get(t, 0.0)) for t in prices.keys())
+    summary["securities_mv"] = securities_mv
+    summary["total_mv"] = new_ca + securities_mv + float(summary["td_invested"]) - float(summary["repo_outstanding"])
     
-    return new_summary, new_positions
+    return summary, positions
 
 # Helper function for staged consumption estimate (moved here before usage)
-def _estimate_used_from_inputs(group_payload: dict, inputs: Dict[str, float], prices: Dict[str, float]) -> float:
+def _estimate_used_from_inputs(group_payload: dict, staged_inputs, prices: Dict[str, float]) -> float:
     """Approximate 'use' toward withdrawal from the current staged inputs."""
+    if not staged_inputs:
+        return 0.0
+    
     s = group_payload["summary"]
     pos = group_payload["positions"]
     used = 0.0
     
-    # 1) cash
-    cash = max(0.0, float(inputs.get("cash", 0.0)))
-    used += min(cash, max(0.0, float(s["current_account"])))
+    # Handle both single input dict and list of cumulative inputs
+    inputs_list = staged_inputs if isinstance(staged_inputs, list) else [staged_inputs]
     
-    # 2) repo
-    repo_amt = max(0.0, float(inputs.get("repo_amt", 0.0)))
-    repo_tick = inputs.get("repo_tick", "(none)")
-    if repo_tick != "(none)" and repo_tick in prices:
-        px = float(prices[repo_tick])
-        collateral_cap = max(0.0, float(pos.get(repo_tick, 0.0))) * px
-        used += min(repo_amt, collateral_cap)
-    
-    # 3) redeem TD
-    redeem = max(0.0, float(inputs.get("redeem", 0.0)))
-    td_invested = max(0.0, float(s["td_invested"]))
-    redeem_actual = min(redeem, td_invested)
-    penalty = redeem_actual * TD_PENALTY
-    used += max(0.0, redeem_actual - penalty)
-    
-    # 4) sell
-    sell_qty = max(0.0, float(inputs.get("sell_qty", 0.0)))
-    sell_tick = inputs.get("sell_tick", "(none)")
-    if sell_tick != "(none)" and sell_tick in prices:
-        pxs = calculate_effective_price_with_spread(float(prices[sell_tick]), False)
-        max_qty = max(0.0, float(pos.get(sell_tick, 0.0)))
-        used += min(sell_qty, max_qty) * pxs
+    for inputs in inputs_list:
+        if not inputs:
+            continue
+            
+        # 1) cash
+        cash = max(0.0, float(inputs.get("cash", 0.0)))
+        used += min(cash, max(0.0, float(s["current_account"])))
+        
+        # 2) repo
+        repo_amt = max(0.0, float(inputs.get("repo_amt", 0.0)))
+        repo_tick = inputs.get("repo_tick", "(none)")
+        if repo_tick != "(none)" and repo_tick in prices:
+            px = float(prices[repo_tick])
+            collateral_cap = max(0.0, float(pos.get(repo_tick, 0.0))) * px
+            used += min(repo_amt, collateral_cap)
+        
+        # 3) redeem TD
+        redeem = max(0.0, float(inputs.get("redeem", 0.0)))
+        td_invested = max(0.0, float(s["td_invested"]))
+        redeem_actual = min(redeem, td_invested)
+        penalty = redeem_actual * TD_PENALTY
+        used += max(0.0, redeem_actual - penalty)
+        
+        # 4) sell
+        sell_qty = max(0.0, float(inputs.get("sell_qty", 0.0)))
+        sell_tick = inputs.get("sell_tick", "(none)")
+        if sell_tick != "(none)" and sell_tick in prices:
+            pxs = calculate_effective_price_with_spread(float(prices[sell_tick]), False)
+            max_qty = max(0.0, float(pos.get(sell_tick, 0.0)))
+            used += min(sell_qty, max_qty) * pxs
     
     return used
 
@@ -1218,33 +1240,46 @@ else:
                     # Handle button clicks outside of callbacks
                     if apply_clicked:
                         inputs = _collect_current_inputs()
-                        # Keep local staged for instant UI reflection
-                        st.session_state.staged_inputs[staged_key] = inputs
-                        # Enqueue by NAME (not index) to avoid mismatches on Host
-                        action = {
-                            "ts": _now_ts(),
-                            "type": "apply",
-                            "by": st.session_state.player_name.strip(),
-                            "group_name": G["name"],  # Use group name for correct binding
-                            "round": r,
-                            "inputs": inputs
-                        }
-                        _json_mutate(ACTIONS_QUEUE_PATH, [], lambda q: (q if isinstance(q, list) else []) + [action])
                         
-                        # Clear local inputs after applying
-                        for k in [cash_key, repo_amt_key, redeem_key, invest_key, sell_qty_key, buy_qty_key]:
-                            if k in st.session_state:
-                                del st.session_state[k]
-                        for k in [repo_tick_key, sell_tick_key, buy_tick_key]:
-                            if k in st.session_state:
-                                del st.session_state[k]
+                        # Get existing staged inputs and make them cumulative
+                        current_staged = st.session_state.staged_inputs.get(staged_key, [])
+                        if not isinstance(current_staged, list):
+                            current_staged = [current_staged] if current_staged else []
                         
-                        st.success("Action applied! Wait for host to refresh or click Apply again to stage more actions.")
+                        # Only add non-zero actions to the staged list
+                        has_action = any([
+                            inputs.get("cash", 0) > 0,
+                            inputs.get("repo_amt", 0) > 0 and inputs.get("repo_tick") != "(none)",
+                            inputs.get("redeem", 0) > 0,
+                            inputs.get("invest_td", 0) > 0,
+                            inputs.get("sell_qty", 0) > 0 and inputs.get("sell_tick") != "(none)",
+                            inputs.get("buy_qty", 0) > 0 and inputs.get("buy_tick") != "(none)"
+                        ])
+                        
+                        if has_action:
+                            current_staged.append(inputs)
+                            st.session_state.staged_inputs[staged_key] = current_staged
+                            
+                            # Enqueue by NAME (not index) to avoid mismatches on Host
+                            action = {
+                                "ts": _now_ts(),
+                                "type": "apply",
+                                "by": st.session_state.player_name.strip(),
+                                "group_name": G["name"],  # Use group name for correct binding
+                                "round": r,
+                                "inputs": inputs
+                            }
+                            _json_mutate(ACTIONS_QUEUE_PATH, [], lambda q: (q if isinstance(q, list) else []) + [action])
+                            
+                            st.success("Action applied! Wait for host to refresh or click Apply again to stage more actions.")
+                        else:
+                            st.warning("Please enter some action values before applying.")
+                        
                         _safe_rerun()
 
                     if clear_clicked:
                         # Clear staged inputs
-                        st.session_state.staged_inputs[staged_key] = {}
+                        st.session_state.staged_inputs[staged_key] = []
                         # Enqueue clear action
                         action = {
                             "ts": _now_ts(),
@@ -1255,14 +1290,6 @@ else:
                             "inputs": {}
                         }
                         _json_mutate(ACTIONS_QUEUE_PATH, [], lambda q: (q if isinstance(q, list) else []) + [action])
-                        
-                        # Clear local inputs
-                        for k in [cash_key, repo_amt_key, redeem_key, invest_key, sell_qty_key, buy_qty_key]:
-                            if k in st.session_state:
-                                del st.session_state[k]
-                        for k in [repo_tick_key, sell_tick_key, buy_tick_key]:
-                            if k in st.session_state:
-                                del st.session_state[k]
                         
                         st.success("Actions cleared!")
                         _safe_rerun()
