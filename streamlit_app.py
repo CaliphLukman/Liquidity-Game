@@ -1183,44 +1183,24 @@ if st.session_state.role == "Host" and r >= st.session_state.rounds:
     last_ix = min(st.session_state.rounds-1, len(df)-1)
     _, final_px_all = base_prices_for_round(last_ix, df, all_tickers)
     
-    st.header("Scoreboard & Logs")
+    st.header("Final Scoreboard & Logs")
+    st.info("💡 **Tip**: Click 'Refresh status' above to get the very latest player actions before viewing final results.")
     
-    # Get latest player portfolio states for accurate final scores
-    all_portfolios = _json_read(PLAYER_PORTFOLIOS_PATH, {})
+    # Use host's current session state portfolios (reflects last refresh)
     rows = []
-    
-    for portfolio_name in [p.name for p in st.session_state.portfolios]:
-        if portfolio_name in all_portfolios:
-            # Load latest player portfolio state
-            portfolio = get_player_portfolio(portfolio_name)
-            if portfolio:
-                # Process final maturities
-                process_maturities(portfolio, r)
-                s = portfolio.summary(final_px_all)
-                rows.append({
-                    "group": portfolio_name,
-                    "current_account": s["current_account"],
-                    "securities_reserve": s["securities_mv"],
-                    "repo_outstanding": s["repo_outstanding"],
-                    "term_deposit": s["td_invested"],
-                    "pnl_realized": s["pnl_realized"],
-                    "total_reserve": s["total_mv"],
-                })
-        else:
-            # Fallback to host session state if no player data found
-            p = next((p for p in st.session_state.portfolios if p.name == portfolio_name), None)
-            if p:
-                process_maturities(p, r)
-                s = p.summary(final_px_all)
-                rows.append({
-                    "group": p.name,
-                    "current_account": s["current_account"],
-                    "securities_reserve": s["securities_mv"],
-                    "repo_outstanding": s["repo_outstanding"],
-                    "term_deposit": s["td_invested"],
-                    "pnl_realized": s["pnl_realized"],
-                    "total_reserve": s["total_mv"],
-                })
+    for p in st.session_state.portfolios:
+        # Process any final maturities
+        process_maturities(p, r)
+        s = p.summary(final_px_all)
+        rows.append({
+            "group": p.name,
+            "current_account": s["current_account"],
+            "securities_reserve": s["securities_mv"],
+            "repo_outstanding": s["repo_outstanding"],
+            "term_deposit": s["td_invested"],
+            "pnl_realized": s["pnl_realized"],
+            "total_reserve": s["total_mv"],
+        })
     
     sb = pd.DataFrame(rows)
     
