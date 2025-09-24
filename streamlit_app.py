@@ -816,8 +816,9 @@ def _host_apply_single_action(p: Portfolio, req_all: float, px_ui: Dict[str, flo
             p.current_account -= use
             rem_left -= use
             history.append(("cash", {"used": round(use, 2)}))
-    # 2) repo
-    if repo_tick != "(none)" and repo_amt > 0 and rem_left > 0:
+    
+    # 2) repo - FIXED: handle excess properly
+    if repo_tick != "(none)" and repo_amt > 0:
         price = float(px_ui.get(repo_tick, 0.0))
         max_amt = p.pos_qty.get(repo_tick, 0.0) * price
         repo_amt = min(repo_amt, max_amt)
@@ -825,45 +826,73 @@ def _host_apply_single_action(p: Portfolio, req_all: float, px_ui: Dict[str, flo
             repo_rate = daily_rates_for_round(r)[0]
             info = _safe_repo_call(p, repo_tick, repo_amt, price, r, repo_rate)
             got = float(info["got"])
-            use = min(got, rem_left)
-            if use > 0:
-                p.current_account -= use
+            
+            # CRITICAL FIX: Split proceeds correctly
+            if rem_left > 0:
+                use = min(got, rem_left)
+                excess = got - use
                 rem_left -= use
+            else:
+                use = 0.0
+                excess = got  # All goes to current account when no withdrawal needed
+            
+            p.current_account += excess  # Add excess to current account
+            
             history.append(("repo", {
                 "ticker": repo_tick, "got": round(got, 2), "use": round(use, 2),
                 "repo_id": info["repo_id"], "rate": repo_rate
             }))
-    # 3) redeem td
-    if redeem_amt > 0 and rem_left > 0:
+    
+    # 3) redeem td - FIXED: handle excess properly
+    if redeem_amt > 0:
         red = _safe_redeem_td(p, redeem_amt, r)
         principal = float(red["principal"])
-        use = min(principal, rem_left)
-        if use > 0:
-            p.current_account -= use
+        
+        # CRITICAL FIX: Split proceeds correctly
+        if rem_left > 0:
+            use = min(principal, rem_left)
+            excess = principal - use
             rem_left -= use
+        else:
+            use = 0.0
+            excess = principal  # All goes to current account when no withdrawal needed
+        
+        p.current_account += excess  # Add excess to current account
+        
         history.append(("redeem_td", {
             "principal": round(principal, 2),
             "penalty":   round(float(red["penalty"]), 2),
             "use":       round(use, 2),
             "chunks":    red.get("redeemed", []),
         }))
-    # 4) sell
-    if sell_tick != "(none)" and sell_qty > 0 and rem_left > 0:
+    
+    # 4) sell - FIXED: handle excess properly
+    if sell_tick != "(none)" and sell_qty > 0:
         sell_qty = min(sell_qty, p.pos_qty.get(sell_tick, 0.0))
         if sell_qty > 0:
             sale = _safe_sale(p, sell_tick, sell_qty, px_ui[sell_tick])
-            use = min(sale["proceeds"], rem_left)
-            if use > 0:
-                p.current_account -= use
+            proceeds = sale["proceeds"]
+            
+            # CRITICAL FIX: Split proceeds correctly
+            if rem_left > 0:
+                use = min(proceeds, rem_left)
+                excess = proceeds - use
                 rem_left -= use
+            else:
+                use = 0.0
+                excess = proceeds  # All goes to current account when no withdrawal needed
+            
+            p.current_account += excess  # Add excess to current account
+            
             history.append(("sell", {
                 "ticker": sale["ticker"],
                 "qty": round(sale["qty"], 2),
-                "proceeds": round(sale["proceeds"], 2),
+                "proceeds": round(proceeds, 2),
                 "use": round(use, 2),
                 "pnl_delta": round(sale["pnl_delta"], 2),
                 "effective_price": round(sale["effective_price"], 6),
             }))
+    
     # 5) invest td
     if invest_amt > 0:
         invest_amt = min(invest_amt, max(0.0, p.current_account))
@@ -1130,13 +1159,24 @@ else:
                 staged_key = f"r{r}_group_{G['name']}"
                 staged_inputs = st.session_state.staged_inputs.get(staged_key, [])
                 
-                # Calculate adjusted state
+                # Calculate adjusted state with detailed debugging
                 if you_own_this_group and staged_inputs:
                     total_withdrawal = float(snapshot.get('withdrawal', 0.0))
+                    original_ca = float(base_s['current_account'])
+                    
                     s, pos = _apply_staged_deltas_to_summary(base_s, base_pos, staged_inputs, prices_ui, r, total_withdrawal)
+                    
+                    # Debug: Show what changed
+                    new_ca = float(s['current_account'])
+                    ca_change = new_ca - original_ca
+                    
                     # Calculate remaining based on how much we've used for withdrawals
                     withdrawal_used = s.get("_withdrawal_used", 0.0)
                     rem_effective = max(0.0, rem_host - withdrawal_used)
+                    
+                    # Debug display for troubleshooting
+                    if ca_change != 0 or withdrawal_used > 0:
+                        st.caption(f"DEBUG: CA change: {_fmt_money(ca_change)}, Withdrawal used: {_fmt_money(withdrawal_used)}")
                 else:
                     s, pos = base_s, base_pos
                     rem_effective = rem_host
