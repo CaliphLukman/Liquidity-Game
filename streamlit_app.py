@@ -781,9 +781,31 @@ if role == "Host":
     ensure_round_initialized(r, prices_all)
     req_all = float(st.session_state.withdrawals[r])
 
-    # Manual refresh (host clicks) - READ ONLY, just updates host view
+    # Manual refresh (host clicks) - Updates host view with latest player portfolio states
     if 'refresh_clicked' in locals() and refresh_clicked:
-        # Just refresh the display, no impact on players
+        # Sync host portfolios with latest player states from shared files
+        all_portfolios = _json_read(PLAYER_PORTFOLIOS_PATH, {})
+        for i, p in enumerate(st.session_state.portfolios):
+            if p.name in all_portfolios:
+                player_data = all_portfolios[p.name]
+                # Update host portfolio with latest player data
+                p.current_account = player_data["current_account"]
+                p.pos_qty = dict(player_data["pos_qty"])
+                p.pnl_realized = player_data["pnl_realized"]
+                p.repo_liabilities = player_data.get("repo_liabilities", [])
+                p.td_assets = player_data.get("td_assets", [])
+                
+                # Reconstruct securities if needed
+                securities_data = player_data.get("securities", {})
+                if securities_data:
+                    from game_core import SecuritySpec
+                    for ticker, spec_data in securities_data.items():
+                        p.securities[ticker] = SecuritySpec(
+                            ticker=spec_data["ticker"],
+                            face_price=spec_data.get("face_price", 100.0),
+                            bid_ask_bps=spec_data.get("bid_ask_bps", 20.0),
+                            liquidity_score=spec_data.get("liquidity_score", 1)
+                        )
         _safe_rerun()
 
 # ------------------------
