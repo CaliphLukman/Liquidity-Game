@@ -664,12 +664,26 @@ if role == "Host" and start_clicked:
                     "last_updated": _now_ts()
                 }
             _json_write_atomic(PLAYER_PORTFOLIOS_PATH, player_portfolios)
+            # Generate withdrawal schedule for all rounds
+            withdrawals = []
+            for round_idx in range(rounds_val):
+                req = generate_withdrawal(
+                    round_idx,
+                    base_portfolios[0].market_value(prices_all0),
+                    random.Random(seed_val + 10007*round_idx)
+                )
+                withdrawals.append(float(req))
+            
+            st.session_state.withdrawals = withdrawals
+            st.session_state.inited_rounds = set(range(rounds_val))
+            
             _json_write_atomic(SHARED_STATE_PATH, {
                 "initialized": True,
                 "rng_seed": seed_val,
                 "rounds": rounds_val,
                 "num_groups": cap,
                 "current_round": 0,
+                "withdrawals": withdrawals,  # Share withdrawals with players
                 "csv_ready": True,
                 "claims": {},   # group_name -> player_name
                 "ts": _now_ts()
@@ -720,7 +734,7 @@ if role == "Player" and not st.session_state.initialized:
     st.session_state.num_groups = int(shared.get("num_groups", 4))
     st.session_state.price_df = df.copy()
     st.session_state.current_round = int(shared.get("current_round", 0))
-    st.session_state.withdrawals = [0.0 for _ in range(st.session_state.rounds)]
+    st.session_state.withdrawals = shared.get("withdrawals", [0.0 for _ in range(st.session_state.rounds)])  # Get from shared state
     st.session_state.logs = {}
     st.session_state.inited_rounds = set()
     st.session_state.last_maturity_round = -1
