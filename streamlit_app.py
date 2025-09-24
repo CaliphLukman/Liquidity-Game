@@ -292,18 +292,23 @@ def calculate_effective_price_with_spread(base_price: float, is_buy: bool, liqui
 # ------------------------
 # Player-side instant state calculation helpers
 # ------------------------
-def _apply_staged_deltas_to_summary(base_summary: dict, base_positions: dict, staged_inputs: dict, prices: dict, r: int) -> Tuple[dict, dict]:
+def _apply_staged_deltas_to_summary(base_summary: dict, base_positions: dict, staged_inputs, prices: dict, r: int, total_withdrawal: float = 0.0) -> Tuple[dict, dict]:
     """Apply staged inputs to create instant player-side view of their portfolio state."""
     # Copy base state
     new_summary = dict(base_summary)
     new_positions = dict(base_positions)
     
+    # Initialize withdrawal tracking
+    new_summary["_withdrawal_used"] = 0.0
+    
     # If staged_inputs is a list of actions (cumulative), process each one
     if isinstance(staged_inputs, list):
         for action_inputs in staged_inputs:
+            action_inputs["_total_withdrawal"] = total_withdrawal
             new_summary, new_positions = _apply_single_staged_action(new_summary, new_positions, action_inputs, prices, r)
     else:
         # Single action
+        staged_inputs["_total_withdrawal"] = total_withdrawal
         new_summary, new_positions = _apply_single_staged_action(new_summary, new_positions, staged_inputs, prices, r)
     
     return new_summary, new_positions
@@ -324,40 +329,49 @@ def _apply_single_staged_action(summary: dict, positions: dict, inputs: dict, pr
     # Apply changes to current account
     new_ca = float(summary["current_account"])
     
-    # 1. Cash use - reduces CA
-    new_ca -= min(cash_use, max(0.0, new_ca))
+    # Track total used towards withdrawal requirement
+    total_used_for_withdrawal = 0.0
     
-    # 2. Repo - get cash from repo, reduce securities
+    # 1. Cash use - reduces CA and counts towards withdrawal
+    if cash_use > 0:
+        actual_cash_use = min(cash_use, max(0.0, new_ca))
+        new_ca -= actual_cash_use
+        total_used_for_withdrawal += actual_cash_use
+    
+    # 2. Repo - get cash from repo, reduce securities, cash used for withdrawal
     if repo_tick != "(none)" and repo_amt > 0 and repo_tick in prices:
         price = float(prices[repo_tick])
         available_collateral = float(positions.get(repo_tick, 0.0)) * price
         actual_repo = min(repo_amt, available_collateral)
         if actual_repo > 0:
-            new_ca += actual_repo  # Get cash from repo
             securities_to_repo = actual_repo / price
             positions[repo_tick] = max(0.0, float(positions.get(repo_tick, 0.0)) - securities_to_repo)
             summary["repo_outstanding"] = float(summary["repo_outstanding"]) + actual_repo
+            # Repo proceeds are used directly for withdrawal, not added to current account
+            total_used_for_withdrawal += actual_repo
     
-    # 3. Redeem TD - get cash, reduce TD investment
+    # 3. Redeem TD - get cash, reduce TD investment, net proceeds used for withdrawal
     if redeem_amt > 0:
         available_td = float(summary["td_invested"])
         actual_redeem = min(redeem_amt, available_td)
         if actual_redeem > 0:
             penalty = actual_redeem * TD_PENALTY
             net_proceeds = actual_redeem - penalty
-            new_ca += net_proceeds
             summary["td_invested"] = available_td - actual_redeem
             summary["pnl_realized"] = float(summary["pnl_realized"]) - penalty
+            # Net proceeds (after penalty) used for withdrawal, not added to current account
+            total_used_for_withdrawal += net_proceeds
     
-    # 4. Sell - get cash, reduce securities
+    # 4. Sell - get cash, reduce securities, proceeds used for withdrawal
     if sell_tick != "(none)" and sell_qty > 0 and sell_tick in prices:
         price = calculate_effective_price_with_spread(float(prices[sell_tick]), False)
         available_qty = float(positions.get(sell_tick, 0.0))
         actual_sell = min(sell_qty, available_qty)
         if actual_sell > 0:
             proceeds = actual_sell * price
-            new_ca += proceeds
             positions[sell_tick] = available_qty - actual_sell
+            # Sell proceeds are used directly for withdrawal, not added to current account
+            total_used_for_withdrawal += proceeds
     
     # 5. Invest TD - use cash, increase TD investment
     if invest_amt > 0:
@@ -379,6 +393,9 @@ def _apply_single_staged_action(summary: dict, positions: dict, inputs: dict, pr
     securities_mv = sum(float(positions.get(t, 0.0)) * float(prices.get(t, 0.0)) for t in prices.keys())
     summary["securities_mv"] = securities_mv
     summary["total_mv"] = new_ca + securities_mv + float(summary["td_invested"]) - float(summary["repo_outstanding"])
+    
+    # Store the amount used for withdrawal tracking
+    summary["_withdrawal_used"] = summary.get("_withdrawal_used", 0.0) + total_used_for_withdrawal
     
     return summary, positions
 
@@ -1030,7 +1047,7 @@ else:
             staged_inputs = st.session_state.staged_inputs.get(staged_key, {})
             
             if you_own_this and staged_inputs:
-                s, positions = _apply_staged_deltas_to_summary(s, positions, staged_inputs, prices_ui, r)
+                s, positions = _apply_staged_deltas_to_summary(s, positions, staged_inputs, prices_ui, r, req_all)
             
             st.markdown(f"### {G['name']}")
             st.markdown(f"<div style='font-size:28px; font-weight:800; color:#006400;'>{_fmt_money(s['total_mv'],0)}</div>", unsafe_allow_html=True)
@@ -1093,16 +1110,17 @@ else:
                 # Apply instant adjustments if this is the player's group
                 you_own_this_group = claims.get(G["name"], "") == st.session_state.player_name.strip()
                 staged_key = f"r{r}_group_{G['name']}"
-                staged_inputs = st.session_state.staged_inputs.get(staged_key, {})
+                staged_inputs = st.session_state.staged_inputs.get(staged_key, [])
                 
                 # Calculate adjusted state
                 if you_own_this_group and staged_inputs:
-                    s, pos = _apply_staged_deltas_to_summary(base_s, base_pos, staged_inputs, prices_ui, r)
-                    staged_used = _estimate_used_from_inputs(G, staged_inputs, prices_ui)
-                    rem_effective = max(0.0, rem_host - staged_used)
+                    total_withdrawal = float(snapshot.get('withdrawal', 0.0))
+                    s, pos = _apply_staged_deltas_to_summary(base_s, base_pos, staged_inputs, prices_ui, r, total_withdrawal)
+                    # Calculate remaining based on how much we've used for withdrawals
+                    withdrawal_used = s.get("_withdrawal_used", 0.0)
+                    rem_effective = max(0.0, rem_host - withdrawal_used)
                 else:
                     s, pos = base_s, base_pos
-                    staged_used = 0.0
                     rem_effective = rem_host
 
                 st.markdown(f"### {G['name']}{' (You)' if (gi==chosen_idx and you_own) else ''}")
@@ -1119,10 +1137,7 @@ else:
 
                 # Show withdrawal progress
                 st.markdown(f"**Withdrawal (all groups):** :blue[{_fmt_money(snapshot.get('withdrawal', 0.0))}]")
-                if staged_used > 0:
-                    st.markdown(f"**Remaining:** :orange[{_fmt_money(rem_host)}] → **After your actions:** :green[{_fmt_money(rem_effective)}]")
-                else:
-                    st.markdown(f"**Remaining:** :orange[{_fmt_money(rem_effective)}]")
+                st.markdown(f"**Remaining:** :orange[{_fmt_money(rem_effective)}]")
 
                 # Show updated positions
                 st.markdown("**Current Holdings:**")
@@ -1271,7 +1286,15 @@ else:
                             }
                             _json_mutate(ACTIONS_QUEUE_PATH, [], lambda q: (q if isinstance(q, list) else []) + [action])
                             
-                            st.success("Action applied! Wait for host to refresh or click Apply again to stage more actions.")
+                            # Clear input fields after successful apply
+                            for k in [cash_key, repo_amt_key, redeem_key, invest_key, sell_qty_key, buy_qty_key]:
+                                if k in st.session_state:
+                                    del st.session_state[k]
+                            for k in [repo_tick_key, sell_tick_key, buy_tick_key]:
+                                if k in st.session_state:
+                                    del st.session_state[k]
+                            
+                            st.success("Action applied! Enter new values and click Apply again to add more actions.")
                         else:
                             st.warning("Please enter some action values before applying.")
                         
@@ -1290,6 +1313,14 @@ else:
                             "inputs": {}
                         }
                         _json_mutate(ACTIONS_QUEUE_PATH, [], lambda q: (q if isinstance(q, list) else []) + [action])
+                        
+                        # Clear input fields
+                        for k in [cash_key, repo_amt_key, redeem_key, invest_key, sell_qty_key, buy_qty_key]:
+                            if k in st.session_state:
+                                del st.session_state[k]
+                        for k in [repo_tick_key, sell_tick_key, buy_tick_key]:
+                            if k in st.session_state:
+                                del st.session_state[k]
                         
                         st.success("Actions cleared!")
                         _safe_rerun()
