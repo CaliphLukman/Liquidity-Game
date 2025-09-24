@@ -282,8 +282,8 @@ def compute_remaining_for_group(group_name: str, r: int, req_for_round: float) -
         for t, d in L["actions"]:
             if t == "cash":
                 used += float(d.get("used", 0.0))
-            elif t in ("repo","sell","redeem_td"):
-                used += float(d.get("use", 0.0))
+            # Remove the automatic counting of repo, sell, redeem_td toward withdrawals
+            # Players must explicitly use cash to cover withdrawals
     return max(0.0, round(req_for_round - used, 2))
 
 def calculate_effective_price_with_spread(base_price: float, is_buy: bool, liquidity_factor: float = 0.005) -> float:
