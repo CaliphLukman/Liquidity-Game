@@ -1166,7 +1166,7 @@ else:
                     
                     s, pos = _apply_staged_deltas_to_summary(base_s, base_pos, staged_inputs, prices_ui, r, total_withdrawal)
                     
-                    # Debug: Show what changed
+                    # Debug: Show what changed with detailed breakdown
                     new_ca = float(s['current_account'])
                     ca_change = new_ca - original_ca
                     
@@ -1177,6 +1177,11 @@ else:
                     # Debug display for troubleshooting
                     if ca_change != 0 or withdrawal_used > 0:
                         st.caption(f"DEBUG: CA change: {_fmt_money(ca_change)}, Withdrawal used: {_fmt_money(withdrawal_used)}")
+                        # Show sell debug info if available
+                        if "_debug_sell" in s:
+                            sell_debug = s["_debug_sell"]
+                            st.caption(f"SELL DEBUG: Proceeds: {_fmt_money(sell_debug['gross_proceeds'])}, To withdrawal: {_fmt_money(sell_debug['withdrawal_amount'])}, To CA: {_fmt_money(sell_debug['ca_amount'])}")
+
                 else:
                     s, pos = base_s, base_pos
                     rem_effective = rem_host
