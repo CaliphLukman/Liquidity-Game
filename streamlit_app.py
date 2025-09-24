@@ -215,14 +215,15 @@ def get_current_prices():
     
     df_data = config["price_data"]
     df = pd.DataFrame(df_data)
+    df = df.reset_index(drop=True)  # Fix index issues
     current_round = state.get("current_round", 0)
     
     all_tickers = [c for c in df.columns if c != "date"]
     tickers_ui = all_tickers[:3]
     
     row_index = min(current_round, len(df) - 1)
-    date_str = str(df.loc[row_index, "date"])
-    prices = {t: float(df.loc[row_index, t]) for t in all_tickers}
+    date_str = str(df.iloc[row_index]["date"])  # Use iloc instead of loc
+    prices = {t: float(df.iloc[row_index][t]) for t in all_tickers}
     
     return prices, tickers_ui
 
