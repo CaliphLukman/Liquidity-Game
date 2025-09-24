@@ -292,7 +292,7 @@ def calculate_effective_price_with_spread(base_price: float, is_buy: bool, liqui
 # ------------------------
 # Player-side instant state calculation helpers
 # ------------------------
-def _apply_staged_deltas_to_summary(base_summary: dict, base_positions: dict, staged_inputs, prices: dict, r: int, total_withdrawal: float = 0.0) -> Tuple[dict, dict]:
+def _apply_staged_deltas_to_summary(base_summary: dict, base_positions: dict, staged_inputs, prices: dict, r: int, total_withdrawal: float = 0.0, host_remaining: float = 0.0) -> Tuple[dict, dict]:
     """Apply staged inputs to create instant player-side view of their portfolio state."""
     # Copy base state
     new_summary = dict(base_summary)
@@ -307,15 +307,20 @@ def _apply_staged_deltas_to_summary(base_summary: dict, base_positions: dict, st
     
     # If staged_inputs is a list of actions (cumulative), process each one
     if isinstance(staged_inputs, list):
+        remaining_for_actions = host_remaining
         for action_inputs in staged_inputs:
             # Make a copy to avoid modifying original
             action_copy = dict(action_inputs)
             action_copy["_total_withdrawal"] = total_withdrawal
+            action_copy["_host_remaining"] = remaining_for_actions
             new_summary, new_positions = _apply_single_staged_action(new_summary, new_positions, action_copy, prices, r)
+            # Update remaining for next action
+            remaining_for_actions = max(0.0, remaining_for_actions - (new_summary.get("_withdrawal_used", 0.0) - action_copy.get("_prev_used", 0.0)))
     else:
         # Single action
         staged_copy = dict(staged_inputs)
         staged_copy["_total_withdrawal"] = total_withdrawal
+        staged_copy["_host_remaining"] = host_remaining
         new_summary, new_positions = _apply_single_staged_action(new_summary, new_positions, staged_copy, prices, r)
     
     return new_summary, new_positions
