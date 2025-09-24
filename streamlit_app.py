@@ -681,7 +681,7 @@ if role == "Player":
         host_round = int(shared.get("current_round", st.session_state.current_round))
         if host_round != st.session_state.current_round:
             st.session_state.current_round = host_round
-            # Clear staged inputs when round changes
+            # Clear staged inputs when round changes but preserve player selection
             st.session_state.staged_inputs = {}
 
 df = st.session_state.price_df
@@ -986,9 +986,20 @@ if role == "Player":
             owner = claims.get(gname, "")
             st.caption(f"{gname}: {'(unclaimed)' if not owner else 'claimed by: ' + owner}")
 
-    # choose + claim
-    chosen = st.sidebar.selectbox("Select your Group", group_names, index=min(st.session_state.player_group_index, len(group_names)-1))
-    st.session_state.player_group_index = group_names.index(chosen)
+    # choose + claim with persistent selection
+    if group_names:
+        # Ensure player_group_index is within valid range
+        valid_index = min(max(st.session_state.player_group_index, 0), len(group_names)-1)
+        if st.session_state.player_group_index != valid_index:
+            st.session_state.player_group_index = valid_index
+        
+        chosen = st.sidebar.selectbox("Select your Group", group_names, 
+                                    index=st.session_state.player_group_index,
+                                    key="player_group_selector")
+        # Update the stored index when selection changes
+        new_index = group_names.index(chosen)
+        if new_index != st.session_state.player_group_index:
+            st.session_state.player_group_index = new_index
 
     can_claim = bool(st.session_state.player_name.strip())
     if st.sidebar.button("Claim Group", disabled=not can_claim):
@@ -1139,11 +1150,24 @@ else:
                 st.markdown(f"**Withdrawal (all groups):** :blue[{_fmt_money(snapshot.get('withdrawal', 0.0))}]")
                 st.markdown(f"**Remaining:** :orange[{_fmt_money(rem_effective)}]")
 
-                # Show updated positions
-                st.markdown("**Current Holdings:**")
+                # Show updated positions with bid/ask spreads for trading decisions
+                st.markdown("**Current Holdings & Market Prices:**")
+                
                 for t in tickers_ui:
                     qty = float(pos.get(t, 0.0))
-                    st.caption(f"{t}: {qty:,.0f} @ {_fmt_money(prices_ui[t])}")
+                    market_px = float(prices_ui[t])
+                    bid_px = calculate_effective_price_with_spread(market_px, False)  # What you get when selling
+                    ask_px = calculate_effective_price_with_spread(market_px, True)   # What you pay when buying
+                    
+                    col1, col2, col3 = st.columns([2, 1, 1])
+                    with col1:
+                        st.metric(f"**{t}**", f"{qty:,.0f} units", f"Market: {_fmt_money(market_px)}")
+                    with col2:
+                        st.caption(f"**Bid:** {_fmt_money(bid_px)}")
+                        st.caption("*(You receive)*")
+                    with col3:
+                        st.caption(f"**Ask:** {_fmt_money(ask_px)}")
+                        st.caption("*(You pay)*")
 
                 # Inputs ONLY on your own claimed group; others read-only
                 if gi == chosen_idx and you_own:
