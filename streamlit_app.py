@@ -779,7 +779,10 @@ if role == "Host":
             process_maturities(p, r)
         st.session_state.last_maturity_round = r
     ensure_round_initialized(r, prices_all)
-    req_all = float(st.session_state.withdrawals[r])
+    # Safe withdrawal access - handle end game scenarios
+    req_all = 0.0
+    if r < len(st.session_state.withdrawals):
+        req_all = float(st.session_state.withdrawals[r])
 
     # Manual refresh (host clicks) - Updates host view with latest player portfolio states
     if 'refresh_clicked' in locals() and refresh_clicked:
@@ -880,13 +883,17 @@ if role == "Host":
         if g >= len(st.session_state.portfolios): break
         with c:
             p = st.session_state.portfolios[g]
-            rem = compute_remaining_for_group(p.name, r, req_all)
+            # Safe withdrawal access for end game scenarios
+            req_all_for_progress = 0.0
+            if r < len(st.session_state.withdrawals):
+                req_all_for_progress = float(st.session_state.withdrawals[r])
+            rem = compute_remaining_for_group(p.name, r, req_all_for_progress)
             reserve = p.market_value(prices_all)
             st.markdown(f"### {p.name}")
             st.markdown(f"<div style='font-size:28px; font-weight:800; color:#006400;'>{_fmt_money(reserve,0)}</div>", unsafe_allow_html=True)
             for t in tickers_ui:
                 st.markdown(f"<div class='ticker-line'>{t}: {p.pos_qty.get(t,0.0):,.0f} @ {_fmt_money(prices_ui[t])}</div>", unsafe_allow_html=True)
-            prog = 0.0 if req_all <= 0 else max(0.0, 1 - rem/req_all)
+            prog = 0.0 if req_all_for_progress <= 0 else max(0.0, 1 - rem/req_all_for_progress)
             st.progress(prog)
 else:
     # Player dashboard reads from shared files
@@ -924,7 +931,11 @@ if role == "Host":
         if g >= len(st.session_state.portfolios): break
         with tab:
             p = st.session_state.portfolios[g]
-            rem = compute_remaining_for_group(p.name, r, req_all)
+            # Safe withdrawal access
+            req_for_tab = 0.0
+            if r < len(st.session_state.withdrawals):
+                req_for_tab = float(st.session_state.withdrawals[r])
+            rem = compute_remaining_for_group(p.name, r, req_for_tab)
             st.markdown(f"### {p.name} (Host View)")
             summary = p.summary(prices_all)
             c1, c2, c3 = st.columns(3)
@@ -937,7 +948,7 @@ if role == "Host":
             with c3:
                 st.metric("PnL Realized",           _fmt_money(summary['pnl_realized']))
                 st.metric("Total Reserve",          _fmt_money(summary['total_mv']))
-            st.markdown(f"**Withdrawal (all groups):** :blue[{_fmt_money(req_all)}]")
+            st.markdown(f"**Withdrawal (all groups):** :blue[{_fmt_money(req_for_tab)}]")
             st.markdown(f"**Remaining for {p.name}:** :orange[{_fmt_money(rem)}]")
 else:
     # Player tabs show portfolios from files
@@ -1173,18 +1184,44 @@ if st.session_state.role == "Host" and r >= st.session_state.rounds:
     _, final_px_all = base_prices_for_round(last_ix, df, all_tickers)
     
     st.header("Scoreboard & Logs")
+    
+    # Get latest player portfolio states for accurate final scores
+    all_portfolios = _json_read(PLAYER_PORTFOLIOS_PATH, {})
     rows = []
-    for p in st.session_state.portfolios:
-        s = p.summary(final_px_all)
-        rows.append({
-            "group": p.name,
-            "current_account": s["current_account"],
-            "securities_reserve": s["securities_mv"],
-            "repo_outstanding": s["repo_outstanding"],
-            "term_deposit": s["td_invested"],
-            "pnl_realized": s["pnl_realized"],
-            "total_reserve": s["total_mv"],
-        })
+    
+    for portfolio_name in [p.name for p in st.session_state.portfolios]:
+        if portfolio_name in all_portfolios:
+            # Load latest player portfolio state
+            portfolio = get_player_portfolio(portfolio_name)
+            if portfolio:
+                # Process final maturities
+                process_maturities(portfolio, r)
+                s = portfolio.summary(final_px_all)
+                rows.append({
+                    "group": portfolio_name,
+                    "current_account": s["current_account"],
+                    "securities_reserve": s["securities_mv"],
+                    "repo_outstanding": s["repo_outstanding"],
+                    "term_deposit": s["td_invested"],
+                    "pnl_realized": s["pnl_realized"],
+                    "total_reserve": s["total_mv"],
+                })
+        else:
+            # Fallback to host session state if no player data found
+            p = next((p for p in st.session_state.portfolios if p.name == portfolio_name), None)
+            if p:
+                process_maturities(p, r)
+                s = p.summary(final_px_all)
+                rows.append({
+                    "group": p.name,
+                    "current_account": s["current_account"],
+                    "securities_reserve": s["securities_mv"],
+                    "repo_outstanding": s["repo_outstanding"],
+                    "term_deposit": s["td_invested"],
+                    "pnl_realized": s["pnl_realized"],
+                    "total_reserve": s["total_mv"],
+                })
+    
     sb = pd.DataFrame(rows)
     
     # Format all monetary columns with dollar signs
