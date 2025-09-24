@@ -166,10 +166,10 @@ TD_MAT_GAP     = 2
 MAX_GROUPS_UI  = 8
 
 # Simple file-based sync (single game, no DB)
-SHARED_STATE_PATH   = ".shared_state.json"   # host pushes session info + claims + current_round
+SHARED_STATE_PATH   = ".shared_state.json"   # host pushes session info + claims + current_round  
 UPLOADED_CSV_PATH   = ".uploaded.csv"        # host saves CSV here
-ACTIONS_QUEUE_PATH  = ".actions_queue.json"  # players enqueue actions
-SNAPSHOT_PATH       = ".snapshot.json"       # host publishes live snapshot for all
+PLAYER_PORTFOLIOS_PATH = ".player_portfolios.json"  # real-time player portfolio states
+SNAPSHOT_PATH       = ".snapshot.json"       # published round info for all
 
 # ------------------------
 # Small helpers
@@ -411,51 +411,199 @@ def _apply_single_staged_action(summary: dict, positions: dict, inputs: dict, pr
     
     return summary, positions
 
-# Helper function for staged consumption estimate (moved here before usage)
-def _estimate_used_from_inputs(group_payload: dict, staged_inputs, prices: Dict[str, float]) -> float:
-    """Approximate 'use' toward withdrawal from the current staged inputs."""
-    if not staged_inputs:
-        return 0.0
+# ------------------------
+# Direct Portfolio Execution Functions
+# ------------------------
+def get_player_portfolio(group_name: str, r: int) -> Optional[Portfolio]:
+    """Get a player's current portfolio state"""
+    player_data = _json_read(PLAYER_PORTFOLIOS_PATH, {})
+    if group_name not in player_data:
+        return None
     
-    s = group_payload["summary"]
-    pos = group_payload["positions"]
-    used = 0.0
+    portfolio_data = player_data[group_name]
+    # Reconstruct portfolio object from saved data
+    portfolio = Portfolio(
+        name=portfolio_data["name"],
+        current_account=portfolio_data["current_account"],
+        pos_qty=portfolio_data["pos_qty"],
+        pnl_realized=portfolio_data["pnl_realized"]
+    )
+    portfolio.repo_liabilities = portfolio_data.get("repo_liabilities", [])
+    portfolio.td_assets = portfolio_data.get("td_assets", [])
+    return portfolio
+
+def save_player_portfolio(portfolio: Portfolio):
+    """Save a player's portfolio state"""
+    def update_portfolios(data):
+        data = data or {}
+        data[portfolio.name] = {
+            "name": portfolio.name,
+            "current_account": portfolio.current_account,
+            "pos_qty": dict(portfolio.pos_qty),
+            "pnl_realized": portfolio.pnl_realized,
+            "repo_liabilities": portfolio.repo_liabilities,
+            "td_assets": portfolio.td_assets,
+            "last_updated": _now_ts()
+        }
+        return data
     
-    # Handle both single input dict and list of cumulative inputs
-    inputs_list = staged_inputs if isinstance(staged_inputs, list) else [staged_inputs]
+    _json_mutate(PLAYER_PORTFOLIOS_PATH, {}, update_portfolios)
+
+def execute_player_action(group_name: str, inputs: dict, prices: dict, r: int, withdrawal_req: float) -> dict:
+    """Execute a player action immediately and return result"""
+    portfolio = get_player_portfolio(group_name, r)
+    if not portfolio:
+        return {"error": "Portfolio not found"}
     
-    for inputs in inputs_list:
-        if not inputs:
-            continue
+    # Process maturities first
+    process_maturities(portfolio, r)
+    
+    # Calculate current remaining withdrawal for this group
+    logs = st.session_state.logs.get(group_name, [])
+    current_round_logs = [L for L in logs if L["round"] == r+1]
+    used_this_round = 0.0
+    for L in current_round_logs:
+        for t, d in L["actions"]:
+            if t in ("cash", "repo", "sell", "redeem_td"):
+                used_this_round += float(d.get("use", 0.0))
+    
+    remaining_withdrawal = max(0.0, withdrawal_req - used_this_round)
+    
+    # Execute the action
+    result = _execute_single_action(portfolio, inputs, prices, r, remaining_withdrawal)
+    
+    # Save updated portfolio
+    save_player_portfolio(portfolio)
+    
+    # Log the action
+    if result.get("actions"):
+        st.session_state.logs.setdefault(group_name, []).append({
+            "round": r + 1,
+            "request": withdrawal_req,
+            "actions": result["actions"],
+            "timestamp": _now_ts()
+        })
+    
+    return result
+
+def _execute_single_action(portfolio: Portfolio, inputs: dict, prices: dict, r: int, remaining_withdrawal: float) -> dict:
+    """Execute a single action on a portfolio and return what happened"""
+    def clamp_float(val): 
+        try: return float(val or 0.0)
+        except: return 0.0
+    
+    # Extract inputs
+    cash_amt = clamp_float(inputs.get("cash"))
+    repo_amt = clamp_float(inputs.get("repo_amt"))
+    repo_tick = inputs.get("repo_tick") or "(none)"
+    redeem_amt = clamp_float(inputs.get("redeem"))
+    invest_amt = clamp_float(inputs.get("invest_td"))
+    sell_qty = clamp_float(inputs.get("sell_qty"))
+    sell_tick = inputs.get("sell_tick") or "(none)"
+    buy_qty = clamp_float(inputs.get("buy_qty"))
+    buy_tick = inputs.get("buy_tick") or "(none)"
+    
+    actions = []
+    rem_left = remaining_withdrawal
+    
+    # 1) Cash use
+    if cash_amt > 0:
+        use = min(cash_amt, max(0.0, portfolio.current_account), rem_left)
+        if use > 0:
+            portfolio.current_account -= use
+            rem_left -= use
+            actions.append(("cash", {"used": round(use, 2)}))
+    
+    # 2) Repo
+    if repo_tick != "(none)" and repo_amt > 0:
+        price = float(prices.get(repo_tick, 0.0))
+        max_amt = portfolio.pos_qty.get(repo_tick, 0.0) * price
+        repo_amt = min(repo_amt, max_amt)
+        if repo_amt > 0:
+            repo_rate = daily_rates_for_round(r)[0]
+            info = _safe_repo_call(portfolio, repo_tick, repo_amt, price, r, repo_rate)
+            got = float(info["got"])
             
-        # 1) cash
-        cash = max(0.0, float(inputs.get("cash", 0.0)))
-        used += min(cash, max(0.0, float(s["current_account"])))
-        
-        # 2) repo
-        repo_amt = max(0.0, float(inputs.get("repo_amt", 0.0)))
-        repo_tick = inputs.get("repo_tick", "(none)")
-        if repo_tick != "(none)" and repo_tick in prices:
-            px = float(prices[repo_tick])
-            collateral_cap = max(0.0, float(pos.get(repo_tick, 0.0))) * px
-            used += min(repo_amt, collateral_cap)
-        
-        # 3) redeem TD
-        redeem = max(0.0, float(inputs.get("redeem", 0.0)))
-        td_invested = max(0.0, float(s["td_invested"]))
-        redeem_actual = min(redeem, td_invested)
-        penalty = redeem_actual * TD_PENALTY
-        used += max(0.0, redeem_actual - penalty)
-        
-        # 4) sell
-        sell_qty = max(0.0, float(inputs.get("sell_qty", 0.0)))
-        sell_tick = inputs.get("sell_tick", "(none)")
-        if sell_tick != "(none)" and sell_tick in prices:
-            pxs = calculate_effective_price_with_spread(float(prices[sell_tick]), False)
-            max_qty = max(0.0, float(pos.get(sell_tick, 0.0)))
-            used += min(sell_qty, max_qty) * pxs
+            # Split proceeds: withdrawal coverage + excess to current account
+            use = min(got, rem_left)
+            excess = got - use
+            portfolio.current_account += excess
+            rem_left -= use
+            
+            actions.append(("repo", {
+                "ticker": repo_tick, "got": round(got, 2), "use": round(use, 2),
+                "excess_to_ca": round(excess, 2), "repo_id": info["repo_id"], "rate": repo_rate
+            }))
     
-    return used
+    # 3) Redeem TD
+    if redeem_amt > 0:
+        red = _safe_redeem_td(portfolio, redeem_amt, r)
+        principal = float(red["principal"])
+        
+        # Split proceeds: withdrawal coverage + excess to current account
+        use = min(principal, rem_left)
+        excess = principal - use
+        portfolio.current_account += excess
+        rem_left -= use
+        
+        actions.append(("redeem_td", {
+            "principal": round(principal, 2),
+            "penalty": round(float(red["penalty"]), 2),
+            "use": round(use, 2),
+            "excess_to_ca": round(excess, 2),
+            "chunks": red.get("redeemed", []),
+        }))
+    
+    # 4) Sell
+    if sell_tick != "(none)" and sell_qty > 0:
+        sell_qty = min(sell_qty, portfolio.pos_qty.get(sell_tick, 0.0))
+        if sell_qty > 0:
+            sale = _safe_sale(portfolio, sell_tick, sell_qty, prices[sell_tick])
+            proceeds = sale["proceeds"]
+            
+            # Split proceeds: withdrawal coverage + excess to current account
+            use = min(proceeds, rem_left)
+            excess = proceeds - use
+            portfolio.current_account += excess
+            rem_left -= use
+            
+            actions.append(("sell", {
+                "ticker": sale["ticker"],
+                "qty": round(sale["qty"], 2),
+                "proceeds": round(proceeds, 2),
+                "use": round(use, 2),
+                "excess_to_ca": round(excess, 2),
+                "pnl_delta": round(sale["pnl_delta"], 2),
+                "effective_price": round(sale["effective_price"], 6),
+            }))
+    
+    # 5) Invest TD
+    if invest_amt > 0:
+        invest_amt = min(invest_amt, max(0.0, portfolio.current_account))
+        if invest_amt > 0:
+            td_rate = daily_rates_for_round(r)[1]
+            td_ids = _safe_invest_td(portfolio, invest_amt, r, td_rate)
+            actions.append(("invest_td", {
+                "amount": round(invest_amt, 2),
+                "td_ids": td_ids,
+                "rate": td_rate
+            }))
+    
+    # 6) Buy
+    if buy_tick != "(none)" and buy_qty > 0:
+        buy = _safe_buy(portfolio, buy_tick, buy_qty, prices[buy_tick])
+        actions.append(("buy", {
+            "ticker": buy["ticker"],
+            "qty": round(buy["qty"], 2),
+            "cost": round(buy["cost"], 2),
+            "effective_price": round(buy["effective_price"], 6),
+        }))
+    
+    return {
+        "actions": actions,
+        "remaining_after": rem_left,
+        "portfolio_summary": portfolio.summary(prices)
+    }
 
 # ---- safe adapters
 def _safe_repo_call(portfolio: Portfolio, ticker: str, amount: float, price: float, rnow: int, rate: float) -> Dict[str, Any]:
@@ -615,8 +763,24 @@ if role == "Host" and start_clicked:
             st.session_state.inited_rounds = set()
             st.session_state.player_group_index = 0
 
-            # Clear queue & claims, publish shared session
-            _json_write_atomic(ACTIONS_QUEUE_PATH, [])
+            # Clear old files and initialize new system
+            for path in [PLAYER_PORTFOLIOS_PATH, SNAPSHOT_PATH]:
+                if os.path.exists(path):
+                    os.remove(path)
+
+            # Initialize player portfolios
+            player_portfolios = {}
+            for p in st.session_state.portfolios:
+                player_portfolios[p.name] = {
+                    "name": p.name,
+                    "current_account": p.current_account,
+                    "pos_qty": dict(p.pos_qty),
+                    "pnl_realized": p.pnl_realized,
+                    "repo_liabilities": list(p.repo_liabilities),
+                    "td_assets": list(p.td_assets),
+                    "last_updated": _now_ts()
+                }
+            _json_write_atomic(PLAYER_PORTFOLIOS_PATH, player_portfolios)
             _json_write_atomic(SHARED_STATE_PATH, {
                 "initialized": True,
                 "rng_seed": seed_val,
@@ -1229,6 +1393,34 @@ else:
                 # Inputs ONLY on your own claimed group; others read-only
                 if gi == chosen_idx and you_own:
                     tickers_ui = snapshot.get("tickers", tickers_ui)
+
+                    def get_float(key, default=0.0):
+                        try: return float(st.session_state.get(key, default) or 0.0)
+                        except: return 0.0
+
+                    # Define input field keys
+                    cash_key      = f"p_cash_{r}_{gi}"
+                    repo_amt_key  = f"p_repo_{r}_{gi}"
+                    repo_tick_key = f"p_repo_t_{r}_{gi}"
+                    redeem_key    = f"p_redeemtd_{r}_{gi}"
+                    invest_key    = f"p_investtd_{r}_{gi}"
+                    sell_qty_key  = f"p_sell_{r}_{gi}"
+                    sell_tick_key = f"p_sell_t_{r}_{gi}"
+                    buy_qty_key   = f"p_buy_{r}_{gi}"
+                    buy_tick_key  = f"p_buy_t_{r}_{gi}"
+
+                    def _collect_current_inputs() -> Dict[str, Any]:
+                        return {
+                            "cash":      get_float(cash_key),
+                            "repo_amt":  get_float(repo_amt_key),
+                            "repo_tick": st.session_state.get(repo_tick_key, "(none)"),
+                            "redeem":    get_float(redeem_key),
+                            "invest_td": get_float(invest_key),
+                            "sell_qty":  get_float(sell_qty_key),
+                            "sell_tick": st.session_state.get(sell_tick_key, "(none)"),
+                            "buy_qty":   get_float(buy_qty_key),
+                            "buy_tick":  st.session_state.get(buy_tick_key, "(none)")
+                        }
 
                     def get_float(key, default=0.0):
                         try: return float(st.session_state.get(key, default) or 0.0)
